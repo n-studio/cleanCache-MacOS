@@ -26,6 +26,7 @@ A Ruby script that cleans temporary files, caches, and build artifacts on macOS 
 | **Cargo (Rust)** | Registry cache |
 | **Composer (PHP)** | Package cache |
 | **Project Artifacts** | `node_modules`, `log`, `__pycache__`, `.pytest_cache`, `.sass-cache`, `.parcel-cache`, `.next/cache`, `.nuxt`, `.turbo`, `coverage`, `.angular/cache` |
+| **Home Directory** | `.babel.json`, `.node-gyp`, `.webdrivers`, `.cache`, `.dotnet`, `.hawtjni`, stale `.zcompdump` files |
 | **macOS System** | Safari, Chrome, CloudKit, Swift PM, TypeScript caches, `~/Library/Logs` |
 ## Requirements
 

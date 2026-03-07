@@ -146,6 +146,27 @@ module CleanCache
     freed
   end
 
+  def self.clean_stale_zcompdumps
+    home = Dir.home
+    current = File.join(home, ".zcompdump")
+    freed = 0
+
+    Dir.glob(File.join(home, ".zcompdump*")).each do |f|
+      next if f == current
+      next if f == "#{current}.zwc"
+      size = File.size(f) rescue 0
+      next if size.zero?
+
+      FileUtils.rm_rf(f)
+      freed += size
+    end
+
+    if freed > 0
+      puts "  #{GREEN}✓#{RESET} Stale zcompdumps: #{human_size(freed)}"
+    end
+    freed
+  end
+
   def self.section(title)
     puts "\n#{BOLD}#{title}#{RESET}"
     yield
@@ -295,6 +316,17 @@ module CleanCache
     # --- Project artifacts ---
     section("Project Artifacts (~/*)") do
       total_freed += clean_project_artifacts.to_i
+    end
+
+    # --- Home directory caches ---
+    section("Home Directory") do
+      total_freed += clean_path("Babel cache", "~/.babel.json").to_i
+      total_freed += clean_path("node-gyp cache", "~/.node-gyp").to_i
+      total_freed += clean_path("Webdrivers cache", "~/.webdrivers").to_i
+      total_freed += clean_path("XDG cache", "~/.cache").to_i
+      total_freed += clean_path(".NET cache", "~/.dotnet").to_i
+      total_freed += clean_path("HawtJNI cache", "~/.hawtjni").to_i
+      total_freed += clean_stale_zcompdumps.to_i
     end
 
     # --- macOS system caches (safe targets only) ---

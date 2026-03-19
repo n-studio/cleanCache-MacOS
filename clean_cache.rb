@@ -5,6 +5,7 @@
 # A Ruby script to clean temporary files and caches on macOS.
 
 require "fileutils"
+require "optparse"
 
 module CleanCache
   BOLD  = "\e[1m"
@@ -172,191 +173,276 @@ module CleanCache
     freed
   end
 
+  CATEGORIES = %w[
+    homebrew npm yarn pnpm bun rbenv mise bundler pip cocoapods carthage
+    docker spotify xcode gradle maven go cargo composer projects home
+    browsers system
+  ].freeze
+
+  def self.parse_args(argv)
+    options = {}
+
+    parser = OptionParser.new do |opts|
+      opts.banner = "Usage: clean_cache.rb [options] [category ...]"
+      opts.separator ""
+      opts.separator "With no arguments, all categories are cleaned."
+      opts.separator ""
+      opts.separator "Categories: #{CATEGORIES.join(", ")}"
+      opts.separator ""
+
+      opts.on("--list", "List available categories") do
+        CATEGORIES.each { |c| puts c }
+        exit
+      end
+
+      opts.on("--exclude CAT", "Exclude a category (can be repeated)") do |cat|
+        unless CATEGORIES.include?(cat)
+          abort "Unknown category: #{cat}\nAvailable: #{CATEGORIES.join(", ")}"
+        end
+        (options[:exclude] ||= []) << cat
+      end
+
+      opts.on("-h", "--help", "Show this help") do
+        puts opts
+        exit
+      end
+    end
+
+    parser.parse!(argv)
+
+    if argv.any?
+      invalid = argv - CATEGORIES
+      abort "Unknown categories: #{invalid.join(", ")}\nAvailable: #{CATEGORIES.join(", ")}" if invalid.any?
+      options[:categories] = argv
+    end
+
+    options
+  end
+
+  def self.enabled?(category, options)
+    if options[:categories]
+      options[:categories].include?(category)
+    elsif options[:exclude]
+      !options[:exclude].include?(category)
+    else
+      true
+    end
+  end
+
   def self.section(title)
     puts "\n#{BOLD}#{title}#{RESET}"
     yield
   end
 
-  def self.clean!
+  def self.clean!(options = {})
     home = Dir.home
     total_freed = 0
 
     puts "#{BOLD}cleanCache-MacOS#{RESET}"
-    puts "Cleaning temporary files and caches...\n"
+    if options[:categories]
+      puts "Cleaning: #{options[:categories].join(", ")}\n"
+    elsif options[:exclude]
+      puts "Cleaning all except: #{options[:exclude].join(", ")}\n"
+    else
+      puts "Cleaning temporary files and caches...\n"
+    end
 
-    # --- Homebrew ---
-    section("Homebrew") do
-      if system("which brew > /dev/null 2>&1")
-        run_command("brew cleanup", "brew cleanup --prune=all -s")
-        total_freed += clean_path("Homebrew cache", "~/Library/Caches/Homebrew").to_i
-        total_freed += clean_path("Homebrew logs", "~/Library/Logs/Homebrew").to_i
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("homebrew", options)
+      section("Homebrew") do
+        if system("which brew > /dev/null 2>&1")
+          run_command("brew cleanup", "brew cleanup --prune=all -s")
+          total_freed += clean_path("Homebrew cache", "~/Library/Caches/Homebrew").to_i
+          total_freed += clean_path("Homebrew logs", "~/Library/Logs/Homebrew").to_i
+        else
+          puts "  (not installed, skipping)"
+        end
       end
     end
 
-    # --- npm ---
-    section("npm") do
-      if system("which npm > /dev/null 2>&1")
-        run_command("npm cache clean", "npm cache clean --force")
-        total_freed += clean_path("npm cache", "~/.npm/_cacache").to_i
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("npm", options)
+      section("npm") do
+        if system("which npm > /dev/null 2>&1")
+          run_command("npm cache clean", "npm cache clean --force")
+          total_freed += clean_path("npm cache", "~/.npm/_cacache").to_i
+        else
+          puts "  (not installed, skipping)"
+        end
       end
     end
 
-    # --- Yarn ---
-    section("Yarn") do
-      if system("which yarn > /dev/null 2>&1")
-        run_command("yarn cache clean", "yarn cache clean")
-        total_freed += clean_path("Yarn cache", "~/Library/Caches/Yarn").to_i
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("yarn", options)
+      section("Yarn") do
+        if system("which yarn > /dev/null 2>&1")
+          run_command("yarn cache clean", "yarn cache clean")
+          total_freed += clean_path("Yarn cache", "~/Library/Caches/Yarn").to_i
+        else
+          puts "  (not installed, skipping)"
+        end
       end
     end
 
-    # --- pnpm ---
-    section("pnpm") do
-      if system("which pnpm > /dev/null 2>&1")
-        run_command("pnpm store prune", "pnpm store prune")
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("pnpm", options)
+      section("pnpm") do
+        if system("which pnpm > /dev/null 2>&1")
+          run_command("pnpm store prune", "pnpm store prune")
+        else
+          puts "  (not installed, skipping)"
+        end
       end
     end
 
-    # --- Bun ---
-    section("Bun") do
-      total_freed += clean_path("Bun install cache", "~/.bun/install/cache").to_i
-    end
-
-    # --- rbenv ---
-    section("rbenv") do
-      total_freed += clean_path("rbenv cache", "~/.rbenv/cache").to_i
-    end
-
-    # --- mise ---
-    section("mise") do
-      if system("which mise > /dev/null 2>&1")
-        run_command("mise cache clear", "mise cache clear")
-        total_freed += clean_path("mise cache", "~/Library/Caches/mise").to_i
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("bun", options)
+      section("Bun") do
+        total_freed += clean_path("Bun install cache", "~/.bun/install/cache").to_i
       end
     end
 
-    # --- Bundler ---
-    section("Bundler") do
-      total_freed += clean_path("Bundler cache", "~/.bundle/cache").to_i
-    end
-
-    # --- pip ---
-    section("pip") do
-      total_freed += clean_path("pip cache", "~/Library/Caches/pip").to_i
-    end
-
-    # --- CocoaPods ---
-    section("CocoaPods") do
-      total_freed += clean_path("CocoaPods cache", "~/Library/Caches/CocoaPods").to_i
-    end
-
-    # --- Carthage ---
-    section("Carthage") do
-      total_freed += clean_path("Carthage cache", "~/Library/Caches/org.carthage.CarthageKit").to_i
-    end
-
-    # --- Docker ---
-    section("Docker") do
-      if system("which docker > /dev/null 2>&1")
-        run_command("docker system prune", "docker system prune -f")
-        run_command("docker builder prune", "docker builder prune -f")
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("rbenv", options)
+      section("rbenv") do
+        total_freed += clean_path("rbenv cache", "~/.rbenv/cache").to_i
       end
     end
 
-    # --- Spotify ---
-    section("Spotify") do
-      total_freed += clean_path("Spotify cache", "~/Library/Caches/com.spotify.client").to_i
-      total_freed += clean_path("Spotify data cache", "~/Library/Application Support/Spotify/PersistentCache").to_i
-    end
-
-    # --- Xcode ---
-    section("Xcode") do
-      total_freed += clean_path("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData").to_i
-      total_freed += clean_old_device_support.to_i
-      total_freed += clean_path("CoreSimulator caches", "~/Library/Developer/CoreSimulator/Caches").to_i
-    end
-
-    # --- Gradle ---
-    section("Gradle") do
-      total_freed += clean_path("Gradle caches", "~/.gradle/caches").to_i
-      total_freed += clean_path("Gradle wrapper dists", "~/.gradle/wrapper/dists").to_i
-    end
-
-    # --- Maven ---
-    section("Maven") do
-      total_freed += clean_path("Maven repository", "~/.m2/repository").to_i
-    end
-
-    # --- Go ---
-    section("Go") do
-      if system("which go > /dev/null 2>&1")
-        run_command("go clean cache", "go clean -cache")
-        run_command("go clean modcache", "go clean -modcache")
-      else
-        puts "  (not installed, skipping)"
+    if enabled?("mise", options)
+      section("mise") do
+        if system("which mise > /dev/null 2>&1")
+          run_command("mise cache clear", "mise cache clear")
+          total_freed += clean_path("mise cache", "~/Library/Caches/mise").to_i
+        else
+          puts "  (not installed, skipping)"
+        end
       end
     end
 
-    # --- Rust / Cargo ---
-    section("Cargo (Rust)") do
-      total_freed += clean_path("Cargo registry cache", "~/.cargo/registry/cache").to_i
+    if enabled?("bundler", options)
+      section("Bundler") do
+        total_freed += clean_path("Bundler cache", "~/.bundle/cache").to_i
+      end
     end
 
-    # --- Composer (PHP) ---
-    section("Composer") do
-      total_freed += clean_path("Composer cache", "~/Library/Caches/composer").to_i
+    if enabled?("pip", options)
+      section("pip") do
+        total_freed += clean_path("pip cache", "~/Library/Caches/pip").to_i
+      end
     end
 
-    # --- Project artifacts ---
-    section("Project Artifacts (~/*)") do
-      total_freed += clean_project_artifacts.to_i
+    if enabled?("cocoapods", options)
+      section("CocoaPods") do
+        total_freed += clean_path("CocoaPods cache", "~/Library/Caches/CocoaPods").to_i
+      end
     end
 
-    # --- Home directory caches ---
-    section("Home Directory") do
-      total_freed += clean_path("Babel cache", "~/.babel.json").to_i
-      total_freed += clean_path("node-gyp cache", "~/.node-gyp").to_i
-      total_freed += clean_path("Webdrivers cache", "~/.webdrivers").to_i
-      total_freed += clean_path("XDG cache", "~/.cache").to_i
-      total_freed += clean_path(".NET cache", "~/.dotnet").to_i
-      total_freed += clean_path("HawtJNI cache", "~/.hawtjni").to_i
-      total_freed += clean_stale_zcompdumps.to_i
+    if enabled?("carthage", options)
+      section("Carthage") do
+        total_freed += clean_path("Carthage cache", "~/Library/Caches/org.carthage.CarthageKit").to_i
+      end
     end
 
-    # --- Browsers ---
-    section("Browsers") do
-      total_freed += clean_path("Safari cache", "~/Library/Caches/com.apple.Safari").to_i
-      total_freed += clean_path("Google Chrome cache", "~/Library/Caches/Google/Chrome").to_i
-      total_freed += clean_path("Firefox cache", "~/Library/Caches/Firefox").to_i
-      total_freed += clean_path("Microsoft Edge cache", "~/Library/Caches/Microsoft Edge").to_i
-      total_freed += clean_path("Brave cache", "~/Library/Caches/BraveSoftware/Brave-Browser").to_i
-      total_freed += clean_path("Opera cache", "~/Library/Caches/com.operasoftware.Opera").to_i
-      total_freed += clean_path("Opera GX cache", "~/Library/Caches/com.operasoftware.OperaGX").to_i
-      total_freed += clean_path("Vivaldi cache", "~/Library/Caches/Vivaldi").to_i
-      total_freed += clean_path("Arc cache", "~/Library/Caches/company.thebrowser.Browser").to_i
+    if enabled?("docker", options)
+      section("Docker") do
+        if system("which docker > /dev/null 2>&1")
+          run_command("docker system prune", "docker system prune -f")
+          run_command("docker builder prune", "docker builder prune -f")
+        else
+          puts "  (not installed, skipping)"
+        end
+      end
     end
 
-    # --- macOS system caches (safe targets only) ---
-    section("macOS System") do
-      total_freed += clean_path("Apple CloudKit cache", "~/Library/Caches/CloudKit").to_i
-      total_freed += clean_path("Swift Package Manager cache", "~/Library/Caches/org.swift.swiftpm").to_i
-      total_freed += clean_path("TypeScript server cache", "~/Library/Caches/typescript").to_i
-      total_freed += clean_path("User logs", "~/Library/Logs").to_i
+    if enabled?("spotify", options)
+      section("Spotify") do
+        total_freed += clean_path("Spotify cache", "~/Library/Caches/com.spotify.client").to_i
+        total_freed += clean_path("Spotify data cache", "~/Library/Application Support/Spotify/PersistentCache").to_i
+      end
+    end
+
+    if enabled?("xcode", options)
+      section("Xcode") do
+        total_freed += clean_path("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData").to_i
+        total_freed += clean_old_device_support.to_i
+        total_freed += clean_path("CoreSimulator caches", "~/Library/Developer/CoreSimulator/Caches").to_i
+      end
+    end
+
+    if enabled?("gradle", options)
+      section("Gradle") do
+        total_freed += clean_path("Gradle caches", "~/.gradle/caches").to_i
+        total_freed += clean_path("Gradle wrapper dists", "~/.gradle/wrapper/dists").to_i
+      end
+    end
+
+    if enabled?("maven", options)
+      section("Maven") do
+        total_freed += clean_path("Maven repository", "~/.m2/repository").to_i
+      end
+    end
+
+    if enabled?("go", options)
+      section("Go") do
+        if system("which go > /dev/null 2>&1")
+          run_command("go clean cache", "go clean -cache")
+          run_command("go clean modcache", "go clean -modcache")
+        else
+          puts "  (not installed, skipping)"
+        end
+      end
+    end
+
+    if enabled?("cargo", options)
+      section("Cargo (Rust)") do
+        total_freed += clean_path("Cargo registry cache", "~/.cargo/registry/cache").to_i
+      end
+    end
+
+    if enabled?("composer", options)
+      section("Composer") do
+        total_freed += clean_path("Composer cache", "~/Library/Caches/composer").to_i
+      end
+    end
+
+    if enabled?("projects", options)
+      section("Project Artifacts (~/*)") do
+        total_freed += clean_project_artifacts.to_i
+      end
+    end
+
+    if enabled?("home", options)
+      section("Home Directory") do
+        total_freed += clean_path("Babel cache", "~/.babel.json").to_i
+        total_freed += clean_path("node-gyp cache", "~/.node-gyp").to_i
+        total_freed += clean_path("Webdrivers cache", "~/.webdrivers").to_i
+        total_freed += clean_path("XDG cache", "~/.cache").to_i
+        total_freed += clean_path(".NET cache", "~/.dotnet").to_i
+        total_freed += clean_path("HawtJNI cache", "~/.hawtjni").to_i
+        total_freed += clean_stale_zcompdumps.to_i
+      end
+    end
+
+    if enabled?("browsers", options)
+      section("Browsers") do
+        total_freed += clean_path("Safari cache", "~/Library/Caches/com.apple.Safari").to_i
+        total_freed += clean_path("Google Chrome cache", "~/Library/Caches/Google/Chrome").to_i
+        total_freed += clean_path("Firefox cache", "~/Library/Caches/Firefox").to_i
+        total_freed += clean_path("Microsoft Edge cache", "~/Library/Caches/Microsoft Edge").to_i
+        total_freed += clean_path("Brave cache", "~/Library/Caches/BraveSoftware/Brave-Browser").to_i
+        total_freed += clean_path("Opera cache", "~/Library/Caches/com.operasoftware.Opera").to_i
+        total_freed += clean_path("Opera GX cache", "~/Library/Caches/com.operasoftware.OperaGX").to_i
+        total_freed += clean_path("Vivaldi cache", "~/Library/Caches/Vivaldi").to_i
+        total_freed += clean_path("Arc cache", "~/Library/Caches/company.thebrowser.Browser").to_i
+      end
+    end
+
+    if enabled?("system", options)
+      section("macOS System") do
+        total_freed += clean_path("Apple CloudKit cache", "~/Library/Caches/CloudKit").to_i
+        total_freed += clean_path("Swift Package Manager cache", "~/Library/Caches/org.swift.swiftpm").to_i
+        total_freed += clean_path("TypeScript server cache", "~/Library/Caches/typescript").to_i
+        total_freed += clean_path("User logs", "~/Library/Logs").to_i
+      end
     end
 
     puts "\n#{BOLD}Done!#{RESET} Freed approximately #{GREEN}#{human_size(total_freed)}#{RESET} of disk space."
   end
 end
 
-CleanCache.clean!
+CleanCache.clean!(CleanCache.parse_args(ARGV))

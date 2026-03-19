@@ -39,8 +39,14 @@ A Ruby script that cleans temporary files, caches, and build artifacts on macOS 
 ```sh
 git clone https://github.com/your-username/cleanCache-MacOS.git
 cd cleanCache-MacOS
-./clean_cache.rb
+./clean_cache.rb                          # clean everything
+./clean_cache.rb browsers docker          # clean only specific categories
+./clean_cache.rb --exclude projects home  # clean everything except these
+./clean_cache.rb --list                   # list available categories
+./clean_cache.rb --help                   # show help
 ```
+
+Available categories: `homebrew`, `npm`, `yarn`, `pnpm`, `bun`, `rbenv`, `mise`, `bundler`, `pip`, `cocoapods`, `carthage`, `docker`, `spotify`, `xcode`, `gradle`, `maven`, `go`, `cargo`, `composer`, `projects`, `home`, `browsers`, `system`
 
 ## How it works
 

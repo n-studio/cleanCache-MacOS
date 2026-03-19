@@ -20,6 +20,7 @@ A Ruby script that cleans temporary files, caches, and build artifacts on macOS 
 | **Docker** | Dangling images, stopped containers, dangling build cache |
 | **Spotify** | Streaming and persistent cache |
 | **Xcode** | DerivedData, iOS DeviceSupport, Simulator caches |
+| **Android Studio** | IDE caches, build cache |
 | **Gradle** | Build caches, wrapper distributions |
 | **Maven** | Local repository |
 | **Go** | Module and build cache |
@@ -46,7 +47,7 @@ cd cleanCache-MacOS
 ./clean_cache.rb --help                   # show help
 ```
 
-Available categories: `homebrew`, `npm`, `yarn`, `pnpm`, `bun`, `rbenv`, `mise`, `bundler`, `pip`, `cocoapods`, `carthage`, `docker`, `spotify`, `xcode`, `gradle`, `maven`, `go`, `cargo`, `composer`, `projects`, `home`, `browsers`, `system`
+Available categories: `homebrew`, `npm`, `yarn`, `pnpm`, `bun`, `rbenv`, `mise`, `bundler`, `pip`, `cocoapods`, `carthage`, `docker`, `spotify`, `xcode`, `android-studio`, `gradle`, `maven`, `go`, `cargo`, `composer`, `projects`, `home`, `browsers`, `system`
 
 ## How it works
 

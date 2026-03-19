@@ -175,8 +175,8 @@ module CleanCache
 
   CATEGORIES = %w[
     homebrew npm yarn pnpm bun rbenv mise bundler pip cocoapods carthage
-    docker spotify xcode gradle maven go cargo composer projects home
-    browsers system
+    docker spotify xcode android-studio gradle maven go cargo composer
+    projects home browsers system
   ].freeze
 
   def self.parse_args(argv)
@@ -361,6 +361,16 @@ module CleanCache
         total_freed += clean_path("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData").to_i
         total_freed += clean_old_device_support.to_i
         total_freed += clean_path("CoreSimulator caches", "~/Library/Developer/CoreSimulator/Caches").to_i
+      end
+    end
+
+    if enabled?("android-studio", options)
+      section("Android Studio") do
+        Dir.glob(File.expand_path("~/Library/Caches/Google/AndroidStudio*")).each do |dir|
+          total_freed += clean_path("Android Studio cache (#{File.basename(dir)})", dir).to_i
+        end
+        total_freed += clean_path("Android build cache", "~/.android/build-cache").to_i
+        total_freed += clean_path("Android cache", "~/.android/cache").to_i
       end
     end
 

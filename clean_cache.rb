@@ -9,8 +9,10 @@ require "optparse"
 
 module CleanCache
   BOLD  = "\e[1m"
+  DIM   = "\e[2m"
   GREEN = "\e[32m"
   RED   = "\e[31m"
+  YELLOW = "\e[33m"
   RESET = "\e[0m"
 
   def self.human_size(bytes)
@@ -175,8 +177,8 @@ module CleanCache
 
   CATEGORIES = %w[
     homebrew npm yarn pnpm bun rbenv mise bundler pip cocoapods carthage
-    docker spotify xcode android-studio gradle maven go cargo composer
-    projects home browsers system
+    docker spotify gaming xcode android-studio gradle maven go cargo
+    composer projects home browsers system
   ].freeze
 
   def self.parse_args(argv)
@@ -189,6 +191,10 @@ module CleanCache
       opts.separator ""
       opts.separator "Categories: #{CATEGORIES.join(", ")}"
       opts.separator ""
+
+      opts.on("--scan", "Scan and show heaviest cleanable directories") do
+        options[:scan] = true
+      end
 
       opts.on("--list", "List available categories") do
         CATEGORIES.each { |c| puts c }
@@ -227,6 +233,85 @@ module CleanCache
     else
       true
     end
+  end
+
+  SCAN_DIRS = [
+    "~/Library/Caches",
+    "~/Library/Logs",
+    "~/Library/Developer/Xcode/DerivedData",
+    "~/Library/Developer/Xcode/iOS DeviceSupport",
+    "~/Library/Developer/CoreSimulator/Caches",
+    "~/Library/Application Support/Spotify/PersistentCache",
+    "~/.gradle/caches",
+    "~/.gradle/wrapper/dists",
+    "~/.m2/repository",
+    "~/.npm",
+    "~/.cache",
+    "~/.cargo/registry",
+    "~/.bun/install/cache",
+    "~/.bundle/cache",
+    "~/.rbenv/cache",
+    "~/.android",
+    "~/.dotnet",
+    "~/.node-gyp",
+  ].freeze
+
+  def self.scan!
+    home = Dir.home
+    puts "#{BOLD}cleanCache-MacOS — Scan Mode#{RESET}"
+    puts "Scanning for cleanable directories...\n\n"
+
+    entries = []
+
+    SCAN_DIRS.each do |raw_path|
+      path = File.expand_path(raw_path)
+      next unless File.directory?(path)
+
+      # For ~/Library/Caches and ~/Library/Logs, list children individually
+      if raw_path == "~/Library/Caches" || raw_path == "~/Library/Logs"
+        begin
+          Dir.children(path).each do |child|
+            child_path = File.join(path, child)
+            next unless File.directory?(child_path)
+            size = dir_size(child_path)
+            next if size.zero?
+            entries << [child_path.sub(home, "~"), size]
+          end
+        rescue Errno::EPERM, Errno::EACCES
+          next
+        end
+      else
+        size = dir_size(path)
+        next if size.zero?
+        entries << [path.sub(home, "~"), size]
+      end
+    end
+
+    if entries.empty?
+      puts "No cleanable directories found."
+      return
+    end
+
+    entries.sort_by! { |_, size| -size }
+
+    # Table layout
+    max_path = [entries.map { |p, _| p.length }.max, 4].max
+    max_size = [entries.map { |_, s| human_size(s).length }.max, 4].max
+    total_width = max_path + 4 + max_size
+
+    puts "#{BOLD}#{"Path".ljust(max_path)}    #{"Size".rjust(max_size)}#{RESET}"
+    puts "#{DIM}#{"─" * total_width}#{RESET}"
+
+    total = 0
+    entries.each do |path, size|
+      total += size
+      color = size >= 1024 * 1024 * 100 ? RED : size >= 1024 * 1024 * 10 ? YELLOW : ""
+      puts "#{path.ljust(max_path)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}"
+    end
+
+    puts "#{DIM}#{"─" * total_width}#{RESET}"
+    puts "#{BOLD}#{"Total".ljust(max_path)}    #{GREEN}#{human_size(total).rjust(max_size)}#{RESET}"
+    puts "\n#{entries.length} directories found. Run without --scan to clean."
   end
 
   def self.section(title)
@@ -356,6 +441,13 @@ module CleanCache
       end
     end
 
+    if enabled?("gaming", options)
+      section("Gaming") do
+        total_freed += clean_path("Steam cache", "~/Library/Caches/Steam").to_i
+        total_freed += clean_path("Epic Games Launcher cache", "~/Library/Caches/com.epicgames.EpicGamesLauncher").to_i
+      end
+    end
+
     if enabled?("xcode", options)
       section("Xcode") do
         total_freed += clean_path("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData").to_i
@@ -435,9 +527,11 @@ module CleanCache
         total_freed += clean_path("Firefox cache", "~/Library/Caches/Firefox").to_i
         total_freed += clean_path("Microsoft Edge cache", "~/Library/Caches/Microsoft Edge").to_i
         total_freed += clean_path("Brave cache", "~/Library/Caches/BraveSoftware/Brave-Browser").to_i
+        total_freed += clean_path("Brave cache", "~/Library/Caches/com.brave.Browser").to_i
         total_freed += clean_path("Opera cache", "~/Library/Caches/com.operasoftware.Opera").to_i
         total_freed += clean_path("Opera GX cache", "~/Library/Caches/com.operasoftware.OperaGX").to_i
         total_freed += clean_path("Vivaldi cache", "~/Library/Caches/Vivaldi").to_i
+        total_freed += clean_path("Vivaldi cache", "~/Library/Caches/com.vivaldi.Vivaldi").to_i
         total_freed += clean_path("Arc cache", "~/Library/Caches/company.thebrowser.Browser").to_i
       end
     end
@@ -455,4 +549,9 @@ module CleanCache
   end
 end
 
-CleanCache.clean!(CleanCache.parse_args(ARGV))
+options = CleanCache.parse_args(ARGV)
+if options[:scan]
+  CleanCache.scan!
+else
+  CleanCache.clean!(options)
+end

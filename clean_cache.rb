@@ -334,13 +334,24 @@ module CleanCache
       total_freed += clean_stale_zcompdumps.to_i
     end
 
+    # --- Browsers ---
+    section("Browsers") do
+      total_freed += clean_path("Safari cache", "~/Library/Caches/com.apple.Safari").to_i
+      total_freed += clean_path("Google Chrome cache", "~/Library/Caches/Google/Chrome").to_i
+      total_freed += clean_path("Firefox cache", "~/Library/Caches/Firefox").to_i
+      total_freed += clean_path("Microsoft Edge cache", "~/Library/Caches/Microsoft Edge").to_i
+      total_freed += clean_path("Brave cache", "~/Library/Caches/BraveSoftware/Brave-Browser").to_i
+      total_freed += clean_path("Opera cache", "~/Library/Caches/com.operasoftware.Opera").to_i
+      total_freed += clean_path("Opera GX cache", "~/Library/Caches/com.operasoftware.OperaGX").to_i
+      total_freed += clean_path("Vivaldi cache", "~/Library/Caches/Vivaldi").to_i
+      total_freed += clean_path("Arc cache", "~/Library/Caches/company.thebrowser.Browser").to_i
+    end
+
     # --- macOS system caches (safe targets only) ---
     section("macOS System") do
       total_freed += clean_path("Apple CloudKit cache", "~/Library/Caches/CloudKit").to_i
-      total_freed += clean_path("Safari cache", "~/Library/Caches/com.apple.Safari").to_i
       total_freed += clean_path("Swift Package Manager cache", "~/Library/Caches/org.swift.swiftpm").to_i
       total_freed += clean_path("TypeScript server cache", "~/Library/Caches/typescript").to_i
-      total_freed += clean_path("Google Chrome cache", "~/Library/Caches/Google/Chrome").to_i
       total_freed += clean_path("User logs", "~/Library/Logs").to_i
     end
 

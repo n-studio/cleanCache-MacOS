@@ -235,13 +235,24 @@ module CleanCache
     end
   end
 
-  SCAN_DIRS = [
+  # Directories whose immediate children are listed individually
+  SCAN_EXPAND_DIRS = [
     "~/Library/Caches",
     "~/Library/Logs",
-    "~/Library/Developer/Xcode/DerivedData",
-    "~/Library/Developer/Xcode/iOS DeviceSupport",
-    "~/Library/Developer/CoreSimulator/Caches",
-    "~/Library/Application Support/Spotify/PersistentCache",
+    "~/Library/Application Support",
+    "~/Library/Containers",
+    "~/Library/Group Containers",
+    "~/Library/Developer/Xcode",
+    "~/Library/Developer/CoreSimulator",
+    "/Library/Caches",
+  ].freeze
+
+  # Specific paths shown as single entries
+  SCAN_SINGLE_DIRS = [
+    "~/.Trash",
+    "~/Library/Application Support/MobileSync/Backup",
+    "~/Library/Developer/Packages",
+    "~/Library/Developer/CommandLineTools",
     "~/.gradle/caches",
     "~/.gradle/wrapper/dists",
     "~/.m2/repository",
@@ -256,6 +267,9 @@ module CleanCache
     "~/.node-gyp",
   ].freeze
 
+  # Minimum size to show in scan results (1 MB)
+  SCAN_MIN_SIZE = 1024 * 1024
+
   def self.scan!
     home = Dir.home
     puts "#{BOLD}cleanCache-MacOS — Scan Mode#{RESET}"
@@ -263,28 +277,29 @@ module CleanCache
 
     entries = []
 
-    SCAN_DIRS.each do |raw_path|
+    SCAN_EXPAND_DIRS.each do |raw_path|
       path = File.expand_path(raw_path)
       next unless File.directory?(path)
 
-      # For ~/Library/Caches and ~/Library/Logs, list children individually
-      if raw_path == "~/Library/Caches" || raw_path == "~/Library/Logs"
-        begin
-          Dir.children(path).each do |child|
-            child_path = File.join(path, child)
-            next unless File.directory?(child_path)
-            size = dir_size(child_path)
-            next if size.zero?
-            entries << [child_path.sub(home, "~"), size]
-          end
-        rescue Errno::EPERM, Errno::EACCES
-          next
+      begin
+        Dir.children(path).each do |child|
+          child_path = File.join(path, child)
+          next unless File.directory?(child_path)
+          size = dir_size(child_path)
+          next if size < SCAN_MIN_SIZE
+          entries << [child_path.sub(home, "~"), size]
         end
-      else
-        size = dir_size(path)
-        next if size.zero?
-        entries << [path.sub(home, "~"), size]
+      rescue Errno::EPERM, Errno::EACCES
+        next
       end
+    end
+
+    SCAN_SINGLE_DIRS.each do |raw_path|
+      path = File.expand_path(raw_path)
+      next unless File.exist?(path)
+      size = dir_size(path)
+      next if size < SCAN_MIN_SIZE
+      entries << [path.sub(home, "~"), size]
     end
 
     if entries.empty?
@@ -311,7 +326,7 @@ module CleanCache
 
     puts "#{DIM}#{"─" * total_width}#{RESET}"
     puts "#{BOLD}#{"Total".ljust(max_path)}    #{GREEN}#{human_size(total).rjust(max_size)}#{RESET}"
-    puts "\n#{entries.length} directories found. Run without --scan to clean."
+    puts "\n#{entries.length} directories (>= 1 MB). Run without --scan to clean."
   end
 
   def self.section(title)

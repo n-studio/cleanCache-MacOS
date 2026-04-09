@@ -178,7 +178,7 @@ module CleanCache
   CATEGORIES = %w[
     homebrew npm yarn pnpm bun rbenv mise bundler pip cocoapods carthage
     docker spotify gaming xcode android-studio gradle maven go cargo
-    composer projects home browsers system
+    composer postman projects home browsers system
   ].freeze
 
   def self.parse_args(argv)
@@ -265,6 +265,7 @@ module CleanCache
     "~/.android",
     "~/.dotnet",
     "~/.node-gyp",
+    "~/Library/Application Support/Postman",
   ].freeze
 
   # Minimum size to show in scan results (1 MB)
@@ -514,6 +515,17 @@ module CleanCache
     if enabled?("composer", options)
       section("Composer") do
         total_freed += clean_path("Composer cache", "~/Library/Caches/composer").to_i
+      end
+    end
+
+    if enabled?("postman", options)
+      section("Postman") do
+        total_freed += clean_path("Postman cache", "~/Library/Caches/Postman").to_i
+        total_freed += clean_path("Postman cache", "~/Library/Caches/com.postmanlabs.mac").to_i
+        total_freed += clean_path("Postman IndexedDB", "~/Library/Application Support/Postman/IndexedDB").to_i
+        total_freed += clean_path("Postman Cache", "~/Library/Application Support/Postman/Cache").to_i
+        total_freed += clean_path("Postman GPUCache", "~/Library/Application Support/Postman/GPUCache").to_i
+        total_freed += clean_path("Postman blob_storage", "~/Library/Application Support/Postman/blob_storage").to_i
       end
     end
 

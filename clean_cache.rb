@@ -36,7 +36,7 @@ module CleanCache
     else
       File.size(path) rescue 0
     end
-  rescue Errno::EPERM, Errno::EACCES
+  rescue Errno::EPERM, Errno::EACCES, Errno::EINTR
     0
   end
 
@@ -50,7 +50,7 @@ module CleanCache
     FileUtils.rm_rf(path)
     puts "  #{GREEN}✓#{RESET} #{label}: #{human_size(size)}"
     size
-  rescue Errno::EPERM, Errno::EACCES
+  rescue Errno::EPERM, Errno::EACCES, Errno::EINTR
     puts "  #{RED}✗#{RESET} #{label}: permission denied (protected by macOS)"
     nil
   end

@@ -40,6 +40,27 @@ module CleanCache
     0
   end
 
+  def self.fast_dir_size(path)
+    path = File.expand_path(path)
+    return 0 unless File.exist?(path)
+    output = `du -sk "#{path}" 2>/dev/null`.strip
+    return 0 if output.empty?
+    output.split("\t").first.to_i * 1024
+  rescue StandardError
+    0
+  end
+
+  def self.disk_usage
+    # On APFS (macOS 10.15+), use the Data volume for accurate container-level totals.
+    # "Used" is computed as total - available since df per-volume "used" excludes other volumes.
+    df_path = File.directory?("/System/Volumes/Data") ? "/System/Volumes/Data" : "/"
+    line = `df -Pk "#{df_path}"`.split("\n").last
+    parts = line.split
+    total = parts[1].to_i * 1024
+    available = parts[3].to_i * 1024
+    [total, total - available, available]
+  end
+
   def self.clean_path(label, path)
     path = File.expand_path(path)
     return unless File.exist?(path)
@@ -196,6 +217,10 @@ module CleanCache
         options[:scan] = true
       end
 
+      opts.on("--storage", "Show disk storage breakdown by category") do
+        options[:storage] = true
+      end
+
       opts.on("--list", "List available categories") do
         CATEGORIES.each { |c| puts c }
         exit
@@ -271,6 +296,14 @@ module CleanCache
   # Minimum size to show in scan results (1 MB)
   SCAN_MIN_SIZE = 1024 * 1024
 
+  # Dotfiles/dotdirs in ~ that are application-related (not personal documents)
+  STORAGE_APP_DOTDIRS = %w[
+    .npm .yarn .pnpm-store .bun .cache .gradle .m2 .cargo .rustup .bundle
+    .rbenv .pyenv .nvm .volta .android .dotnet .cocoapods .node-gyp .composer
+    .docker .gem .local .mix .hex .config .swiftpm .mise .hawtjni .webdrivers
+    .vscode .cursor .conda .virtualenvs
+  ].freeze
+
   def self.scan!
     home = Dir.home
     puts "#{BOLD}cleanCache-MacOS — Scan Mode#{RESET}"
@@ -328,6 +361,139 @@ module CleanCache
     puts "#{DIM}#{"─" * total_width}#{RESET}"
     puts "#{BOLD}#{"Total".ljust(max_path)}    #{GREEN}#{human_size(total).rjust(max_size)}#{RESET}"
     puts "\n#{entries.length} directories (>= 1 MB). Run without --scan to clean."
+  end
+
+  def self.storage!
+    home = Dir.home
+    puts "#{BOLD}cleanCache-MacOS — Storage#{RESET}"
+    puts "Analyzing disk usage...\n\n"
+
+    total_disk, used_disk, avail_disk = disk_usage
+
+    # 1. Applications: /Applications + ~/Library (minus iOS backups) + app dotdirs
+    print "  Scanning Applications..."; $stdout.flush
+    app_size = fast_dir_size("/Applications")
+    lib_size = fast_dir_size("#{home}/Library")
+    ios_size = fast_dir_size("#{home}/Library/Application Support/MobileSync")
+    app_lib = [lib_size - ios_size, 0].max
+    app_dots = STORAGE_APP_DOTDIRS.sum { |d| fast_dir_size(File.join(home, d)) }
+    applications = app_size + app_lib + app_dots
+    puts " done"
+
+    # 2. Movies
+    print "  Scanning Movies..."; $stdout.flush
+    movies = fast_dir_size("#{home}/Movies")
+    puts " done"
+
+    # 3. Music
+    print "  Scanning Music..."; $stdout.flush
+    music = fast_dir_size("#{home}/Music")
+    puts " done"
+
+    # 4. Pictures
+    print "  Scanning Pictures..."; $stdout.flush
+    pictures = fast_dir_size("#{home}/Pictures")
+    puts " done"
+
+    # 5. Downloads
+    print "  Scanning Downloads..."; $stdout.flush
+    downloads = fast_dir_size("#{home}/Downloads")
+    puts " done"
+
+    # 6. Documents: everything in ~ not app-related and not media/Library/Trash
+    print "  Scanning Documents..."; $stdout.flush
+    excluded_home = %w[Library Movies Music Pictures Downloads .Trash] + STORAGE_APP_DOTDIRS
+    documents = 0
+    begin
+      Dir.children(home).each do |child|
+        next if excluded_home.include?(child)
+        full = File.join(home, child)
+        documents += File.directory?(full) ? fast_dir_size(full) : (File.size(full) rescue 0)
+      end
+    rescue Errno::EPERM, Errno::EACCES
+    end
+    puts " done"
+
+    # 8. iOS Files
+    ios_files = ios_size
+
+    # 9. Trash
+    print "  Scanning Trash..."; $stdout.flush
+    trash = fast_dir_size("#{home}/.Trash")
+    puts " done"
+
+    # 10. Others: system-level directories outside user home
+    print "  Scanning other directories..."; $stdout.flush
+    others_detail = []
+    %w[/Library /opt/homebrew /usr/local].each do |p|
+      next unless File.exist?(p)
+      size = fast_dir_size(p)
+      others_detail << [p, size] if size > SCAN_MIN_SIZE
+    end
+    if File.directory?("/Users")
+      begin
+        Dir.children("/Users").each do |u|
+          next if u == File.basename(home) || u.start_with?(".")
+          path = "/Users/#{u}"
+          next unless File.directory?(path)
+          size = fast_dir_size(path)
+          others_detail << [path, size] if size > SCAN_MIN_SIZE
+        end
+      rescue Errno::EPERM, Errno::EACCES
+      end
+    end
+    others = others_detail.sum { |_, s| s }
+    puts " done"
+
+    # 7. macOS = remainder (system volume, kernel, APFS metadata, etc.)
+    measured = applications + movies + music + pictures + downloads +
+               documents + ios_files + trash + others
+    os_size = [used_disk - measured, 0].max
+
+    # Build results in display order
+    results = [
+      ["Applications", applications],
+      ["Movies",       movies],
+      ["Music",        music],
+      ["Pictures",     pictures],
+      ["Downloads",    downloads],
+      ["Documents",    documents],
+      ["macOS",        os_size],
+      ["iOS Files",    ios_files],
+      ["Trash",        trash],
+      ["Others",       others],
+    ]
+
+    puts ""
+    max_name = [results.map { |n, _| n.length }.max, 8].max
+    max_size = [results.map { |_, s| human_size(s).length }.max, 4].max
+    bar_width = 20
+    total_width = max_name + 4 + max_size + 3 + 6 + 3 + bar_width
+
+    puts "#{BOLD}#{"Category".ljust(max_name)}    #{"Size".rjust(max_size)}   #{"  %".rjust(6)}   Bar#{RESET}"
+    puts "#{DIM}#{"─" * total_width}#{RESET}"
+
+    results.each do |name, size|
+      pct = used_disk > 0 ? (size.to_f / used_disk * 100) : 0
+      filled = [[0, (pct / 100 * bar_width).round].max, bar_width].min
+      bar = "█" * filled + "░" * (bar_width - filled)
+      color = size >= 1024**3 * 10 ? RED : size >= 1024**3 ? YELLOW : ""
+      puts "#{name.ljust(max_name)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}   #{format("%5.1f%%", pct)}   #{color}#{bar}#{RESET}"
+    end
+
+    puts "#{DIM}#{"─" * total_width}#{RESET}"
+    puts "#{BOLD}#{"Used".ljust(max_name)}    #{human_size(used_disk).rjust(max_size)}#{RESET}"
+    puts "#{"Available".ljust(max_name)}    #{GREEN}#{human_size(avail_disk).rjust(max_size)}#{RESET}"
+    puts "#{BOLD}#{"Capacity".ljust(max_name)}    #{human_size(total_disk).rjust(max_size)}#{RESET}"
+
+    if others_detail.any?
+      puts "\n#{BOLD}Others breakdown:#{RESET}"
+      max_other = others_detail.map { |p, _| p.length }.max
+      others_detail.sort_by { |_, s| -s }.each do |path, size|
+        color = size >= 1024**3 * 10 ? RED : size >= 1024**3 ? YELLOW : ""
+        puts "  #{path.ljust(max_other)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}"
+      end
+    end
   end
 
   def self.section(title)
@@ -579,6 +745,8 @@ end
 options = CleanCache.parse_args(ARGV)
 if options[:scan]
   CleanCache.scan!
+elsif options[:storage]
+  CleanCache.storage!
 else
   CleanCache.clean!(options)
 end

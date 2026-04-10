@@ -370,15 +370,34 @@ module CleanCache
 
     total_disk, used_disk, avail_disk = disk_usage
 
-    # 1. Applications: /Applications + ~/Library (minus iOS backups) + app dotdirs
+    # 1. Applications: /Applications + ~/Library (minus iOS backups, Developer, Android, Docker) + app dotdirs (minus .docker) + Homebrew
     print "  Scanning Applications..."; $stdout.flush
     app_size = fast_dir_size("/Applications")
     lib_size = fast_dir_size("#{home}/Library")
     ios_size = fast_dir_size("#{home}/Library/Application Support/MobileSync")
-    app_lib = [lib_size - ios_size, 0].max
-    app_dots = STORAGE_APP_DOTDIRS.sum { |d| fast_dir_size(File.join(home, d)) }
-    applications = app_size + app_lib + app_dots
+    developer_size = fast_dir_size("#{home}/Library/Developer")
+    sys_developer_size = fast_dir_size("/Library/Developer")
+    android_size = fast_dir_size("#{home}/Library/Android")
+    docker_container_size = fast_dir_size("#{home}/Library/Containers/com.docker.docker")
+    docker_app_support_size = fast_dir_size("#{home}/Library/Application Support/Docker Desktop")
+    docker_group_size = fast_dir_size("#{home}/Library/Group Containers/group.com.docker")
+    docker_dotdir_size = fast_dir_size("#{home}/.docker")
+    docker_lib = docker_container_size + docker_app_support_size + docker_group_size
+    homebrew_size = fast_dir_size("/opt/homebrew")
+    app_lib = [lib_size - ios_size - developer_size - android_size - docker_lib, 0].max
+    app_dots = STORAGE_APP_DOTDIRS.reject { |d| d == ".docker" }
+                                  .sum { |d| fast_dir_size(File.join(home, d)) }
+    applications = app_size + app_lib + app_dots + homebrew_size
     puts " done"
+
+    # 2. Developer: ~/Library/Developer + /Library/Developer (Xcode, CoreSimulator runtimes, CLT, etc.)
+    developer = developer_size + sys_developer_size
+
+    # 3. Android: ~/Library/Android (Android Studio SDKs, AVDs, etc.)
+    android = android_size
+
+    # 4. Docker: VM disk + group containers + app support + ~/.docker
+    docker = docker_lib + docker_dotdir_size
 
     # 2. Movies
     print "  Scanning Movies..."; $stdout.flush
@@ -422,12 +441,14 @@ module CleanCache
     trash = fast_dir_size("#{home}/.Trash")
     puts " done"
 
-    # 10. Others: system-level directories outside user home
+    # 10. Others: system-level directories outside user home (excluding Homebrew + /Library/Developer, which are accounted for above)
     print "  Scanning other directories..."; $stdout.flush
     others_detail = []
-    %w[/Library /opt/homebrew /usr/local].each do |p|
+    %w[/Library /usr/local].each do |p|
       next unless File.exist?(p)
       size = fast_dir_size(p)
+      size -= sys_developer_size if p == "/Library"
+      size = [size, 0].max
       others_detail << [p, size] if size > SCAN_MIN_SIZE
     end
     if File.directory?("/Users")
@@ -445,14 +466,17 @@ module CleanCache
     others = others_detail.sum { |_, s| s }
     puts " done"
 
-    # 7. macOS = remainder (system volume, kernel, APFS metadata, etc.)
-    measured = applications + movies + music + pictures + downloads +
-               documents + ios_files + trash + others
+    # macOS = remainder (system volume, kernel, APFS metadata, etc.)
+    measured = applications + developer + android + docker + movies + music +
+               pictures + downloads + documents + ios_files + trash + others
     os_size = [used_disk - measured, 0].max
 
     # Build results in display order
     results = [
       ["Applications", applications],
+      ["Developer",    developer],
+      ["Android",      android],
+      ["Docker",       docker],
       ["Movies",       movies],
       ["Music",        music],
       ["Pictures",     pictures],
@@ -635,6 +659,10 @@ module CleanCache
         total_freed += clean_path("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData").to_i
         total_freed += clean_old_device_support.to_i
         total_freed += clean_path("CoreSimulator caches", "~/Library/Developer/CoreSimulator/Caches").to_i
+        if system("which xcrun > /dev/null 2>&1")
+          run_command("xcrun simctl delete unavailable", "xcrun simctl delete unavailable")
+          run_command("xcrun simctl runtime delete unused", "xcrun simctl runtime delete unused")
+        end
       end
     end
 

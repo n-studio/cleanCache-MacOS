@@ -43,7 +43,7 @@ module CleanCache
   def self.fast_dir_size(path)
     path = File.expand_path(path)
     return 0 unless File.exist?(path)
-    output = `du -sk "#{path}" 2>/dev/null`.strip
+    output = `du -skx "#{path}" 2>/dev/null`.strip
     return 0 if output.empty?
     output.split("\t").first.to_i * 1024
   rescue StandardError
@@ -59,6 +59,38 @@ module CleanCache
     total = parts[1].to_i * 1024
     available = parts[3].to_i * 1024
     [total, total - available, available]
+  end
+
+  # Sizes of APFS sibling volumes (System, Preboot, Recovery, VM) in the same
+  # container as the Data volume.  These consume container capacity that df
+  # reports as "used" but that du never sees because they are separate volumes.
+  def self.apfs_sibling_volumes_size
+    output = `diskutil apfs list 2>/dev/null`
+    return 0 if output.empty?
+
+    # Find the container that holds the Data role volume
+    containers = output.split(/^\+-- Container /)
+    containers.shift # drop text before first container
+
+    containers.each do |block|
+      volumes = block.split(/\+-> Volume /)
+      volumes.shift # container header
+
+      has_data = volumes.any? { |v| v =~ /\(Data\)/ }
+      next unless has_data
+
+      sibling_bytes = 0
+      volumes.each do |v|
+        next if v =~ /\(Data\)/
+        if v =~ /Capacity Consumed:\s+(\d+)\s+B\b/
+          sibling_bytes += $1.to_i
+        end
+      end
+      return sibling_bytes
+    end
+    0
+  rescue StandardError
+    0
   end
 
   def self.clean_path(label, path)
@@ -293,8 +325,8 @@ module CleanCache
     "~/Library/Application Support/Postman",
   ].freeze
 
-  # Minimum size to show in scan results (1 MB)
-  SCAN_MIN_SIZE = 1024 * 1024
+  # Minimum size to show in scan results (1 GB)
+  SCAN_MIN_SIZE = 1024 * 1024 * 1024
 
   # Dotfiles/dotdirs in ~ that are application-related (not personal documents)
   STORAGE_APP_DOTDIRS = %w[
@@ -363,6 +395,11 @@ module CleanCache
     puts "\n#{entries.length} directories (>= 1 MB). Run without --scan to clean."
   end
 
+  # Invariant: the sum of every category below must equal the total used disk.
+  # "Other" is NOT a residual (used_disk - accounted) — that hides bugs.
+  # If the categories don't add up to used_disk, the accounting is wrong and
+  # the code must be fixed (e.g. a path is missed, double-counted, or
+  # mis-categorised). Treat any discrepancy as a bug, not a rounding artefact.
   def self.storage!
     home = Dir.home
     puts "#{BOLD}cleanCache-MacOS — Storage#{RESET}"
@@ -383,15 +420,21 @@ module CleanCache
     docker_group_size = fast_dir_size("#{home}/Library/Group Containers/group.com.docker")
     docker_dotdir_size = fast_dir_size("#{home}/.docker")
     docker_lib = docker_container_size + docker_app_support_size + docker_group_size
+    macos_logs_size = [fast_dir_size("#{home}/Library/Logs") - fast_dir_size("#{home}/Library/Logs/Homebrew"), 0].max
+    macos_system_size =
+      fast_dir_size("#{home}/Library/Caches/CloudKit") +
+      fast_dir_size("#{home}/Library/Caches/typescript") +
+      macos_logs_size
     homebrew_size = fast_dir_size("/opt/homebrew")
-    app_lib = [lib_size - ios_size - developer_size - android_size - docker_lib, 0].max
+    swiftpm_size = fast_dir_size("#{home}/Library/Caches/org.swift.swiftpm")
+    app_lib = [lib_size - ios_size - developer_size - android_size - docker_lib - macos_system_size - swiftpm_size, 0].max
     app_dots = STORAGE_APP_DOTDIRS.reject { |d| d == ".docker" }
                                   .sum { |d| fast_dir_size(File.join(home, d)) }
     applications = app_size + app_lib + app_dots + homebrew_size
     puts " done"
 
-    # 2. Developer: ~/Library/Developer + /Library/Developer (Xcode, CoreSimulator runtimes, CLT, etc.)
-    developer = developer_size + sys_developer_size
+    # 2. Developer: ~/Library/Developer + /Library/Developer + SPM cache (Xcode, CoreSimulator runtimes, CLT, etc.)
+    developer = developer_size + sys_developer_size + swiftpm_size
 
     # 3. Android: ~/Library/Android (Android Studio SDKs, AVDs, etc.)
     android = android_size
@@ -441,37 +484,100 @@ module CleanCache
     trash = fast_dir_size("#{home}/.Trash")
     puts " done"
 
-    # 10. Others: system-level directories outside user home (excluding Homebrew + /Library/Developer, which are accounted for above)
-    print "  Scanning other directories..."; $stdout.flush
-    others_detail = []
-    %w[/Library /usr/local].each do |p|
-      next unless File.exist?(p)
-      size = fast_dir_size(p)
-      size -= sys_developer_size if p == "/Library"
-      size = [size, 0].max
-      others_detail << [p, size] if size > SCAN_MIN_SIZE
-    end
+    # Other Users: secondary user accounts on this machine.
+    print "  Scanning other users..."; $stdout.flush
+    other_users_detail = []
     if File.directory?("/Users")
       begin
         Dir.children("/Users").each do |u|
-          next if u == File.basename(home) || u.start_with?(".")
+          next if u == File.basename(home) || u == "Shared" || u.start_with?(".")
           path = "/Users/#{u}"
           next unless File.directory?(path)
           size = fast_dir_size(path)
-          others_detail << [path, size] if size > SCAN_MIN_SIZE
+          other_users_detail << [path, size] if size > SCAN_MIN_SIZE
         end
       rescue Errno::EPERM, Errno::EACCES
       end
     end
-    others = others_detail.sum { |_, s| s }
+    other_users = other_users_detail.sum { |_, s| s }
     puts " done"
 
-    # macOS = remainder (system volume, kernel, APFS metadata, etc.)
-    measured = applications + developer + android + docker + movies + music +
-               pictures + downloads + documents + ios_files + trash + others
-    os_size = [used_disk - measured, 0].max
+    # macOS: user Library paths related to macOS cleanup handled by this tool.
+    print "  Scanning macOS caches..."; $stdout.flush
+    os_size = macos_system_size
+    puts " done"
 
-    # Build results in display order
+    # System: OS-level files outside the user home (firmlinked /private, /usr, /opt,
+    # extra Data volume content, shared user dir, and volume metadata).
+    print "  Scanning system files..."; $stdout.flush
+    system_detail = []
+    private_size = fast_dir_size("/private")
+    system_detail << ["/private", private_size] if private_size > SCAN_MIN_SIZE
+
+    # /Library minus /Library/Developer (already in Developer)
+    sys_lib_size = [fast_dir_size("/Library") - sys_developer_size, 0].max
+    system_detail << ["/Library", sys_lib_size] if sys_lib_size > SCAN_MIN_SIZE
+
+    # /System/Volumes/Data/System holds extra Library content (voices, mobile assets, etc.)
+    data_system_size = fast_dir_size("/System/Volumes/Data/System")
+    system_detail << ["/System/Volumes/Data/System", data_system_size] if data_system_size > SCAN_MIN_SIZE
+
+    # /usr/local is firmlinked to the Data volume; the rest of /usr lives on
+    # the SSV and is already counted via apfs_sibling_volumes_size.
+    usr_local_size = fast_dir_size("/usr/local")
+    system_detail << ["/usr/local", usr_local_size] if usr_local_size > SCAN_MIN_SIZE
+
+    # /opt minus /opt/homebrew (already in Applications)
+    opt_size = [fast_dir_size("/opt") - homebrew_size, 0].max
+    system_detail << ["/opt", opt_size] if opt_size > SCAN_MIN_SIZE
+
+    # /Users/Shared
+    shared_size = fast_dir_size("/Users/Shared")
+    system_detail << ["/Users/Shared", shared_size] if shared_size > SCAN_MIN_SIZE
+
+    # Data volume metadata (mostly permission-restricted, best-effort)
+    metadata_size = 0
+    %w[
+      .Spotlight-V100 .fseventsd .DocumentRevisions-V100
+      .PreviousSystemInformation MobileSoftwareUpdate
+    ].each do |p|
+      metadata_size += fast_dir_size("/System/Volumes/Data/#{p}")
+    end
+    system_detail << ["Volume metadata", metadata_size] if metadata_size > SCAN_MIN_SIZE
+
+    # APFS sibling volumes (macOS System, Preboot, Recovery) share the container
+    # whose capacity df reports — account for them explicitly.
+    sibling_size = apfs_sibling_volumes_size
+    system_detail << ["APFS volumes (OS)", sibling_size] if sibling_size > SCAN_MIN_SIZE
+
+    system_files = private_size + sys_lib_size + data_system_size +
+                   usr_local_size + opt_size + shared_size +
+                   metadata_size + sibling_size
+    puts " done"
+
+    # Root-level directories not covered by the categories above — listed
+    # individually as their own rows. No catch-all "Other" aggregate.
+    print "  Scanning root..."; $stdout.flush
+    extra_root_detail = []
+    accounted_root = %w[Applications Library Users private usr opt System bin sbin]
+    # Symlinks to /private (already counted) and out-of-volume / special mounts.
+    firmlink_root = %w[etc tmp var Volumes dev home cores]
+    begin
+      Dir.children("/").each do |child|
+        next if accounted_root.include?(child) || firmlink_root.include?(child)
+        next if child.start_with?(".")
+        path = "/#{child}"
+        next unless File.directory?(path)
+        size = fast_dir_size(path)
+        extra_root_detail << [path, size] if size > 0
+      end
+    rescue Errno::EPERM, Errno::EACCES
+    end
+    puts " done"
+
+    # Build results in display order. Every byte lives in a named row —
+    # no catch-all "Other" aggregate. Stray root-level paths are appended
+    # as their own explicit rows below.
     results = [
       ["Applications", applications],
       ["Developer",    developer],
@@ -483,10 +589,43 @@ module CleanCache
       ["Downloads",    downloads],
       ["Documents",    documents],
       ["macOS",        os_size],
+      ["System",       system_files],
       ["iOS Files",    ios_files],
       ["Trash",        trash],
-      ["Others",       others],
+      ["Other Users",  other_users],
     ]
+    extra_root_detail.sort_by { |_, s| -s }.each do |path, size|
+      results << [path, size]
+    end
+
+    # Tight-invariant anchor: the apparent total of the Data volume + the
+    # sibling APFS volumes (System/Preboot/Recovery/VM) is what every category
+    # combined must equal. Anything else is a bug — a missed path or a
+    # double-count between categories.
+    print "  Verifying volume coverage..."; $stdout.flush
+    data_apparent = fast_dir_size("/System/Volumes/Data")
+    expected_apparent = data_apparent + sibling_size
+    puts " done"
+
+    # Tight invariant: sum(categories) == du(Data volume) + sibling volumes.
+    # Any deviation is a bug — a missed path or a double-count between
+    # categories. Check this BEFORE adjusting for APFS clone savings.
+    measured = results.sum { |_, s| s }
+    accounting_error = measured - expected_apparent
+
+    # APFS clonefile(2) lets files share blocks, so the apparent total
+    # (what du reports per path) exceeds actual blocks on disk (what df
+    # reports). Attribute the savings to System: macOS clones are
+    # concentrated in OS-managed paths (cryptex, dyld_shared_cache,
+    # MobileAssets — all under /private and /System/Volumes/Data/System).
+    # After this adjustment, sum(categories) == used_disk.
+    clone_savings = expected_apparent - used_disk
+    if clone_savings > 0
+      results = results.map do |name, size|
+        name == "System" ? [name, [size - clone_savings, 0].max] : [name, size]
+      end
+    end
+    adjusted_total = results.sum { |_, s| s }
 
     puts ""
     max_name = [results.map { |n, _| n.length }.max, 8].max
@@ -498,7 +637,7 @@ module CleanCache
     puts "#{DIM}#{"─" * total_width}#{RESET}"
 
     results.each do |name, size|
-      pct = used_disk > 0 ? (size.to_f / used_disk * 100) : 0
+      pct = adjusted_total > 0 ? (size.to_f / adjusted_total * 100) : 0
       filled = [[0, (pct / 100 * bar_width).round].max, bar_width].min
       bar = "█" * filled + "░" * (bar_width - filled)
       color = size >= 1024**3 * 10 ? RED : size >= 1024**3 ? YELLOW : ""
@@ -509,15 +648,31 @@ module CleanCache
     puts "#{BOLD}#{"Used".ljust(max_name)}    #{human_size(used_disk).rjust(max_size)}#{RESET}"
     puts "#{"Available".ljust(max_name)}    #{GREEN}#{human_size(avail_disk).rjust(max_size)}#{RESET}"
     puts "#{BOLD}#{"Capacity".ljust(max_name)}    #{human_size(total_disk).rjust(max_size)}#{RESET}"
+    if clone_savings > SCAN_MIN_SIZE
+      puts "#{DIM}System reduced by #{human_size(clone_savings)} of APFS clone-shared blocks (cryptex / dyld / MobileAssets).#{RESET}"
+    end
 
-    if others_detail.any?
-      puts "\n#{BOLD}Others breakdown:#{RESET}"
-      max_other = others_detail.map { |p, _| p.length }.max
-      others_detail.sort_by { |_, s| -s }.each do |path, size|
+    # Tight invariant violation (pre-adjustment): a path is missed,
+    # double-counted, or mis-categorised in the storage accounting.
+    if accounting_error.abs > SCAN_MIN_SIZE
+      sign = accounting_error > 0 ? "double-counted" : "unaccounted"
+      puts ""
+      puts "#{YELLOW}⚠  Accounting bug: #{human_size(accounting_error.abs)} #{sign}#{RESET}"
+      puts "#{DIM}   Sum of categories (#{human_size(measured)}) ≠ volume apparent total (#{human_size(expected_apparent)}). Fix storage! accounting.#{RESET}"
+    end
+
+    print_breakdown = lambda do |title, detail|
+      next if detail.empty?
+      puts "\n#{BOLD}#{title}:#{RESET}"
+      max_path = detail.map { |p, _| p.length }.max
+      detail.sort_by { |_, s| -s }.each do |path, size|
         color = size >= 1024**3 * 10 ? RED : size >= 1024**3 ? YELLOW : ""
-        puts "  #{path.ljust(max_other)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}"
+        puts "  #{path.ljust(max_path)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}"
       end
     end
+
+    print_breakdown.call("System breakdown", system_detail)
+    print_breakdown.call("Other Users breakdown", other_users_detail)
   end
 
   def self.section(title)
@@ -659,6 +814,7 @@ module CleanCache
         total_freed += clean_path("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData").to_i
         total_freed += clean_old_device_support.to_i
         total_freed += clean_path("CoreSimulator caches", "~/Library/Developer/CoreSimulator/Caches").to_i
+        total_freed += clean_path("Swift Package Manager cache", "~/Library/Caches/org.swift.swiftpm").to_i
         if system("which xcrun > /dev/null 2>&1")
           run_command("xcrun simctl delete unavailable", "xcrun simctl delete unavailable")
           run_command("xcrun simctl runtime delete unused", "xcrun simctl runtime delete unused")
@@ -760,7 +916,6 @@ module CleanCache
     if enabled?("system", options)
       section("macOS System") do
         total_freed += clean_path("Apple CloudKit cache", "~/Library/Caches/CloudKit").to_i
-        total_freed += clean_path("Swift Package Manager cache", "~/Library/Caches/org.swift.swiftpm").to_i
         total_freed += clean_path("TypeScript server cache", "~/Library/Caches/typescript").to_i
         total_freed += clean_path("User logs", "~/Library/Logs").to_i
       end

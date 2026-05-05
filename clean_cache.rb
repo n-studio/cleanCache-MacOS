@@ -1059,6 +1059,10 @@ module CleanCache
     puts "  #{BOLD}#{"Total".ljust(max_name)}    #{human_size(total).rjust(max_size)}#{RESET}"
   end
 
+  # Brew's own var subdirs (not service data, not orphans). `db` holds nested
+  # per-formula data dirs like var/db/redis, so it's a category, not orphan.
+  HOMEBREW_INTERNAL_VARS = %w[log homebrew cache run lib db].freeze
+
   def self.inspect_homebrew!
     brew_root = "/opt/homebrew"
     puts "#{BOLD}cleanCache-MacOS — Inspect: Homebrew#{RESET}"
@@ -1071,27 +1075,77 @@ module CleanCache
     # Cellar = formula installations, Caskroom = cask metadata,
     # var/* = brew services data (postgres/mongo/mysql DBs, logs) — real user
     # data, not cache. Surfaced here because it dominates Homebrew's footprint.
-    entries = []
-    groups = [
-      ["Cellar",   ""],
-      ["Caskroom", " (cask)"],
-      ["var",      " (var)"],
-    ]
-    groups.each do |kind, suffix|
-      base = File.join(brew_root, kind)
-      next unless File.directory?(base)
-      Dir.children(base).each do |name|
+    cellar_dir = File.join(brew_root, "Cellar")
+    installed = File.directory?(cellar_dir) ? Dir.children(cellar_dir).reject { |n| n.start_with?(".") } : []
+
+    # Each row: [label, size, path, override_color]
+    rows = []
+
+    if File.directory?(cellar_dir)
+      Dir.children(cellar_dir).each do |name|
         next if name.start_with?(".")
-        path = File.join(base, name)
+        path = File.join(cellar_dir, name)
         next unless File.directory?(path)
         size = fast_dir_size(path)
         next if size.zero?
-        entries << ["#{name}#{suffix}", size]
+        rows << [name, size, nil, nil]
       end
     end
 
-    entries.sort_by! { |_, s| -s }
-    print_inspect_table(entries)
+    cask_dir = File.join(brew_root, "Caskroom")
+    if File.directory?(cask_dir)
+      Dir.children(cask_dir).each do |name|
+        next if name.start_with?(".")
+        path = File.join(cask_dir, name)
+        next unless File.directory?(path)
+        size = fast_dir_size(path)
+        next if size.zero?
+        rows << ["#{name} (cask)", size, nil, nil]
+      end
+    end
+
+    var_dir = File.join(brew_root, "var")
+    if File.directory?(var_dir)
+      Dir.children(var_dir).each do |name|
+        next if name.start_with?(".")
+        path = File.join(var_dir, name)
+        next unless File.directory?(path)
+        size = fast_dir_size(path)
+        next if size.zero?
+        # Orphan = data dir left behind after `brew uninstall`. Allow prefix
+        # match so var/mongodb pairs with Cellar/mongodb-community.
+        orphan = !HOMEBREW_INTERNAL_VARS.include?(name) &&
+                 !installed.any? { |f| f == name || f.start_with?("#{name}-") }
+        rows << ["#{name} (var)", size, path, orphan ? RED : nil]
+      end
+    end
+
+    rows.sort_by! { |_, s, _, _| -s }
+
+    if rows.empty?
+      puts "(nothing to show)"
+      return
+    end
+
+    max_name = rows.map { |n, _, _, _| n.length }.max
+    max_size = rows.map { |_, s, _, _| human_size(s).length }.max
+    max_path = rows.map { |_, _, p, _| p ? p.length : 0 }.max
+    total = rows.sum { |_, s, _, _| s }
+    width = max_name + 4 + max_size + (max_path > 0 ? 4 + max_path : 0)
+
+    rows.each do |name, size, path, override|
+      size_color = override || (size >= 1024**3 * 10 ? RED : size >= 1024**3 ? YELLOW : "")
+      name_color = override || ""
+      path_str = path ? "    #{override || DIM}#{path}#{RESET}" : ""
+      puts "  #{name_color}#{name.ljust(max_name)}#{RESET}    #{size_color}#{human_size(size).rjust(max_size)}#{RESET}#{path_str}"
+    end
+    puts "  #{DIM}#{"─" * width}#{RESET}"
+    puts "  #{BOLD}#{"Total".ljust(max_name)}    #{human_size(total).rjust(max_size)}#{RESET}"
+
+    orphans = rows.count { |_, _, _, o| o == RED }
+    if orphans > 0
+      puts "#{DIM}#{orphans} var dir(s) in red have no matching installed formula — likely leftover data from `brew uninstall`.#{RESET}"
+    end
   end
 
   # Homebrew Postgres clusters live under /opt/homebrew/var/postgres*; only

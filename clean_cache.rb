@@ -141,6 +141,87 @@ module CleanCache
     freed
   end
 
+  # Chromium-based browsers (Chrome, Brave, Edge, Opera, Vivaldi, Arc) ship
+  # their main framework as <App>.app/Contents/Frameworks/<X> Framework.framework
+  # with versioned subdirs under Versions/ and a "Current" symlink to the
+  # active one. Each update writes a new version (~600–700 MB) but old ones
+  # are kept indefinitely. Only the Current target is loaded; deleting the
+  # others is safe — even while the browser is running, since open file
+  # handles keep the running version alive until the process exits.
+  def self.clean_old_chromium_frameworks
+    freed = 0
+    Dir.glob("/Applications/*.app/Contents/Frameworks/*.framework/Versions").each do |versions_dir|
+      current_link = File.join(versions_dir, "Current")
+      next unless File.symlink?(current_link)
+
+      current = File.readlink(current_link)
+      target = File.expand_path(current, versions_dir)
+      next unless File.directory?(target)
+      current_name = File.basename(target)
+
+      old_versions = Dir.children(versions_dir)
+        .reject { |name| name == "Current" || name == current_name }
+        .map { |name| File.join(versions_dir, name) }
+        .select { |path| File.directory?(path) && !File.symlink?(path) }
+      next if old_versions.empty?
+
+      app_name = versions_dir[%r{/Applications/([^/]+)\.app/}, 1]
+      bundle_freed = 0
+      old_versions.each do |old|
+        size = fast_dir_size(old)
+        FileUtils.rm_rf(old)
+        next if File.exist?(old)
+        bundle_freed += size
+      end
+
+      if bundle_freed > 0
+        puts "  #{GREEN}✓#{RESET} Old framework versions (#{app_name}, kept #{current_name}): #{human_size(bundle_freed)}"
+        freed += bundle_freed
+      end
+    end
+    freed
+  end
+
+  # macOS sandbox keeps a per-bundle code-sign clone tree at
+  # /private/var/folders/<prefix>/<user-hash>/X/<bundle-id>.code_sign_clone/
+  # (sibling of $TMPDIR), with one subdir per code-signing verification.
+  # Chrome and its forks (Brave, Edge, Opera, Vivaldi, Arc) accumulate one
+  # per auto-update without ever cleaning up — easily tens of GB. The
+  # snapshots are APFS-cloned, so apparent size dwarfs real disk impact, but
+  # they still take real bytes. Keep the most-recent snapshot per bundle as
+  # a safety fallback; delete the rest.
+  def self.clean_old_code_sign_clones
+    tmpdir = ENV["TMPDIR"]
+    return 0 if tmpdir.nil? || tmpdir.empty?
+
+    workspace = File.join(File.dirname(tmpdir.sub(%r{/+\z}, "")), "X")
+    return 0 unless File.directory?(workspace)
+
+    freed = 0
+    Dir.glob(File.join(workspace, "*.code_sign_clone")).each do |bundle_dir|
+      snapshots = Dir.children(bundle_dir)
+        .map { |c| File.join(bundle_dir, c) }
+        .select { |p| File.directory?(p) }
+      next if snapshots.size <= 1
+
+      snapshots.sort_by! { |p| File.mtime(p) rescue Time.at(0) }
+      bundle_name = File.basename(bundle_dir).sub(/\.code_sign_clone\z/, "")
+      bundle_freed = 0
+      snapshots[0..-2].each do |old|
+        size = dir_size(old)
+        FileUtils.rm_rf(old)
+        next if File.exist?(old)
+        bundle_freed += size
+      end
+
+      if bundle_freed > 0
+        puts "  #{GREEN}✓#{RESET} Code-sign clones (#{bundle_name}): #{human_size(bundle_freed)}"
+        freed += bundle_freed
+      end
+    end
+    freed
+  end
+
   # macOS creates "Relocated Items" / "Previously Relocated Items N" in
   # /Users/Shared on each system update — snapshots of default config files
   # (mostly /etc/ssh/*) preserved in case the user customised them. Keep the
@@ -292,6 +373,10 @@ module CleanCache
         options[:storage] = true
       end
 
+      opts.on("--force-purge", "Fill disk to evict APFS purgeable bytes, then clean up") do
+        options[:force_purge] = true
+      end
+
       opts.on("--list", "List available categories") do
         CATEGORIES.each { |c| puts c }
         exit
@@ -432,6 +517,151 @@ module CleanCache
     puts "#{DIM}#{"─" * total_width}#{RESET}"
     puts "#{BOLD}#{"Total".ljust(max_path)}    #{GREEN}#{human_size(total).rjust(max_size)}#{RESET}"
     puts "\n#{entries.length} directories (>= 1 MB). Run without --scan to clean."
+  end
+
+  # Force-purge: trigger eviction of APFS purgeable content (Photos optimised
+  # originals, iCloud Drive cached files, on-device AI assets, app caches that
+  # opted into NSPurgeable, downloaded language packs, etc.).
+  #
+  # The mechanism: macOS only evicts purgeable bytes under disk pressure.
+  # There's no public API to ask for eviction directly — `diskutil`, `tmutil`
+  # and `purge(8)` don't cover it. The standard workaround is to manufacture
+  # the pressure by writing a large file. As free space drops, the kernel
+  # walks its purgeable-resource list and frees what it can; once we delete
+  # the fill file, the bytes the kernel evicted are the net win. We can see
+  # the win by comparing `df` available before the fill vs after cleanup.
+  #
+  # How this implementation works:
+  #   1. Snapshot avail via df (disk_usage), refuse if too close to floor.
+  #   2. Open a fill file at /tmp/cleanCache-MacOS-purge.fill (chosen because
+  #      /tmp is on the Data volume, and macOS clears /tmp on reboot — so a
+  #      worst-case orphan recovers automatically).
+  #   3. Loop: re-check df, write a 64 MB chunk of zeros, fsync. Stop when
+  #      written ≥ max_fill, when avail dips to the floor, or on ENOSPC.
+  #      Re-checking every chunk lets concurrent writes (downloads, builds)
+  #      push us off without us crashing the system.
+  #   4. Delete the fill file. Re-check df; the gain over step 1 is what was
+  #      evicted.
+  #
+  # Why zeros are safe: APFS does not deduplicate at write time. Clones are
+  # only created via clonefile(2). A normal write(2) of zero bytes still
+  # consumes blocks — that's what we need.
+  #
+  # Why this is bounded: three independent caps — FORCE_PURGE_MAX_FILL is
+  # an absolute byte ceiling, FORCE_PURGE_FLOOR_BYTES is an absolute
+  # available-space floor, and we re-derive `size` against the current avail
+  # on every chunk. Whichever cap binds first stops the loop.
+  #
+  # Why cleanup is reliable: the fill file is removed by an idempotent
+  # cleanup lambda invoked from three independent points — the `ensure` of
+  # the write loop (normal exit and most exceptions), an `at_exit` handler
+  # (SystemExit and uncaught exceptions), and SIGINT/SIGTERM traps (Ctrl-C
+  # and `kill`). A `cleaned_up` flag makes re-entry a no-op. The only way
+  # to leak the fill file is SIGKILL or a power loss, in which case the
+  # next reboot wipes /tmp.
+  #
+  # Costs: writes up to FORCE_PURGE_MAX_FILL bytes of SSD wear per run, and
+  # blocks for ~max_fill / SSD_throughput seconds (≈20s for 100 GB on Apple
+  # silicon). Use sparingly.
+  FORCE_PURGE_FLOOR_BYTES   = 10 * 1024**3       # never fill below 10 GB available
+  FORCE_PURGE_MAX_FILL      = 100 * 1024**3      # never write more than 100 GB
+  FORCE_PURGE_CHUNK_BYTES   = 64 * 1024 * 1024   # 64 MB chunks → frequent re-checks
+  FORCE_PURGE_HEADROOM      = 5 * 1024**3        # require this much room above floor to start
+  FORCE_PURGE_PATH          = "/tmp/cleanCache-MacOS-purge.fill"
+
+  def self.force_purge!
+    fill_path = FORCE_PURGE_PATH
+
+    total, _used, avail = disk_usage
+    puts "#{BOLD}cleanCache-MacOS — Force purge#{RESET}"
+    puts "Fills the disk to evict APFS purgeable bytes, then deletes the fill."
+    puts ""
+    puts "  Disk:        #{human_size(total)}"
+    puts "  Available:   #{human_size(avail)}"
+    puts "  Floor:       #{human_size(FORCE_PURGE_FLOOR_BYTES)} (will not fill below this)"
+    puts "  Max fill:    #{human_size(FORCE_PURGE_MAX_FILL)}"
+    puts "  Fill path:   #{fill_path}"
+    puts ""
+
+    if avail <= FORCE_PURGE_FLOOR_BYTES + FORCE_PURGE_HEADROOM
+      puts "#{YELLOW}Refusing to run: available space (#{human_size(avail)}) is too close to the floor.#{RESET}"
+      puts "  Need at least #{human_size(FORCE_PURGE_FLOOR_BYTES + FORCE_PURGE_HEADROOM)} available."
+      return
+    end
+
+    if File.exist?(fill_path)
+      puts "#{RED}Refusing to run: a fill file already exists at #{fill_path}.#{RESET}"
+      puts "  If no purge is currently running, remove it manually and retry."
+      return
+    end
+
+    max_fill = [avail - FORCE_PURGE_FLOOR_BYTES, FORCE_PURGE_MAX_FILL].min
+    puts "Will write up to #{human_size(max_fill)} of zeros, then delete it."
+    puts "Note: writes ~#{human_size(max_fill)} to your SSD. Use sparingly."
+    puts ""
+    print "Type #{BOLD}yes#{RESET} to proceed: "
+    $stdout.flush
+    answer = ($stdin.gets || "").strip
+    unless answer == "yes"
+      puts "Aborted."
+      return
+    end
+
+    cleaned_up = false
+    cleanup = lambda do
+      next if cleaned_up
+      cleaned_up = true
+      next unless File.exist?(fill_path)
+      bytes = (File.size(fill_path) rescue 0)
+      File.unlink(fill_path) rescue nil
+      puts ""
+      puts "  #{GREEN}✓#{RESET} Removed fill file (#{human_size(bytes)})"
+    end
+
+    at_exit(&cleanup)
+    trap("INT")  { cleanup.call; exit 130 }
+    trap("TERM") { cleanup.call; exit 143 }
+
+    chunk = "\0".b * FORCE_PURGE_CHUNK_BYTES
+    written = 0
+    stop_reason = nil
+    begin
+      File.open(fill_path, "wb") do |f|
+        while written < max_fill
+          _, _, current_avail = disk_usage
+          if current_avail <= FORCE_PURGE_FLOOR_BYTES
+            stop_reason = "hit floor (#{human_size(current_avail)} available)"
+            break
+          end
+          remaining_to_floor = current_avail - FORCE_PURGE_FLOOR_BYTES
+          size = [FORCE_PURGE_CHUNK_BYTES, max_fill - written, remaining_to_floor].min
+          break if size <= 0
+          f.write(size == FORCE_PURGE_CHUNK_BYTES ? chunk : chunk.byteslice(0, size))
+          f.fsync
+          written += size
+          printf "\r  Filled: %s  (avail: %s)   ", human_size(written), human_size(current_avail)
+          $stdout.flush
+        end
+      end
+    rescue Errno::ENOSPC
+      stop_reason = "disk full"
+    ensure
+      cleanup.call
+    end
+
+    _, _, after_avail = disk_usage
+    reclaimed = after_avail - avail
+    puts ""
+    puts "  Stopped: #{stop_reason}" if stop_reason
+    if reclaimed > 0
+      puts "#{GREEN}Reclaimed #{human_size(reclaimed)} of purgeable space.#{RESET}"
+      puts "  Available: #{human_size(avail)} → #{human_size(after_avail)}"
+    elsif reclaimed < 0
+      puts "#{YELLOW}Available decreased by #{human_size(-reclaimed)} (other writes during purge?).#{RESET}"
+      puts "  Available: #{human_size(avail)} → #{human_size(after_avail)}"
+    else
+      puts "No purgeable space was reclaimed."
+    end
   end
 
   # Invariant: the sum of every category below must equal the total used disk.
@@ -641,16 +871,25 @@ module CleanCache
     measured = results.sum { |_, s| s }
     accounting_error = measured - expected_apparent
 
-    # APFS clonefile(2) lets files share blocks, so the apparent total
-    # (what du reports per path) exceeds actual blocks on disk (what df
-    # reports). Attribute the savings to System Cache: macOS clones are
-    # concentrated in /private (cryptex, dyld_shared_cache, install caches).
-    # After this adjustment, sum(categories) == used_disk.
+    # Two effects pull (sum of categories) away from used_disk:
+    #   - APFS clonefile(2) shares blocks between files, so du's apparent total
+    #     can exceed real disk usage. Attribute the savings to System Cache
+    #     (where macOS clones are concentrated: cryptex, dyld_shared_cache,
+    #     install caches).
+    #   - TCC-protected paths du can't traverse without sudo (Apple Intelligence
+    #     ML models under AssetsV2, .Spotlight-V100, .fseventsd, com.apple.TCC,
+    #     etc.) hide bytes that df still counts. Surface them as "Reserved".
+    # After adjustment, sum(categories) == used_disk.
     clone_savings = expected_apparent - used_disk
+    reserved_size = 0
     if clone_savings > 0
       results = results.map do |name, size|
         name == "System Cache" ? [name, [size - clone_savings, 0].max] : [name, size]
       end
+    elsif clone_savings < 0
+      reserved_size = -clone_savings
+      idx = results.index { |name, _| name == "System Files" } || results.size
+      results.insert(idx + 1, ["Reserved (sudo)", reserved_size])
     end
     adjusted_total = results.sum { |_, s| s }
 
@@ -677,6 +916,9 @@ module CleanCache
     puts "#{BOLD}#{"Capacity".ljust(max_name)}    #{human_size(total_disk).rjust(max_size)}#{RESET}"
     if clone_savings > SCAN_MIN_SIZE
       puts "#{DIM}System Cache reduced by #{human_size(clone_savings)} of APFS clone-shared blocks (cryptex / dyld / install caches).#{RESET}"
+    end
+    if reserved_size > SCAN_MIN_SIZE
+      puts "#{DIM}Reserved holds TCC-protected paths du can't traverse (Apple Intelligence models, Spotlight, fseventsd) — re-run with sudo for detail.#{RESET}"
     end
 
     # Tight invariant violation (pre-adjustment): a path is missed,
@@ -936,6 +1178,7 @@ module CleanCache
         total_freed += clean_path("Vivaldi cache", "~/Library/Caches/Vivaldi").to_i
         total_freed += clean_path("Vivaldi cache", "~/Library/Caches/com.vivaldi.Vivaldi").to_i
         total_freed += clean_path("Arc cache", "~/Library/Caches/company.thebrowser.Browser").to_i
+        total_freed += clean_old_chromium_frameworks.to_i
       end
     end
 
@@ -945,6 +1188,7 @@ module CleanCache
         total_freed += clean_path("TypeScript server cache", "~/Library/Caches/typescript").to_i
         total_freed += clean_path("User logs", "~/Library/Logs").to_i
         total_freed += clean_old_relocated_items.to_i
+        total_freed += clean_old_code_sign_clones.to_i
       end
     end
 
@@ -957,6 +1201,8 @@ if options[:scan]
   CleanCache.scan!
 elsif options[:storage]
   CleanCache.storage!
+elsif options[:force_purge]
+  CleanCache.force_purge!
 else
   CleanCache.clean!(options)
 end

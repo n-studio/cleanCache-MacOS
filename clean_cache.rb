@@ -348,13 +348,64 @@ module CleanCache
     freed
   end
 
+  # Drops PostgreSQL databases whose name ends with _test_<digits> — parallel
+  # test fixtures (Rails parallel tests, pytest-postgres, etc.) that are
+  # auto-recreated by the test framework and safe to remove.
+  def self.clean_postgresql_test_databases
+    clusters = postgresql_clusters
+    if clusters.empty?
+      puts "  (no PostgreSQL clusters found)"
+      return 0
+    end
+
+    pattern = '_test_[0-9]+$'
+    total_freed = 0
+    clusters.each do |cluster_path|
+      cluster_name = File.basename(cluster_path)
+      endpoint = postgresql_running_endpoint(cluster_path)
+      unless endpoint
+        puts "  #{DIM}#{cluster_name}: not running, skipping#{RESET}"
+        next
+      end
+
+      psql = psql_for(cluster_name)
+      list_query = "SELECT datname, pg_database_size(datname) FROM pg_database WHERE datname ~ '#{pattern}' ORDER BY 1;"
+      output = `"#{psql}" -h "#{endpoint[:socket_dir]}" -p #{endpoint[:port]} -d postgres -At -F'|' -c "#{list_query}" 2>/dev/null`
+      unless $?.success?
+        puts "  #{RED}✗#{RESET} #{cluster_name}: psql query failed"
+        next
+      end
+
+      targets = output.lines.map { |l| l.chomp.split("|", 2) }
+                            .select { |name, size| name && size }
+                            .map { |name, size| [name, size.to_i] }
+
+      if targets.empty?
+        puts "  #{DIM}#{cluster_name}: no _test_<n> databases found#{RESET}"
+        next
+      end
+
+      targets.each do |name, size|
+        next if name.include?('"') # paranoia: skip names that would break quoting
+        drop = `"#{psql}" -h "#{endpoint[:socket_dir]}" -p #{endpoint[:port]} -d postgres -c 'DROP DATABASE "#{name}" WITH (FORCE);' 2>&1`
+        if $?.success?
+          puts "  #{GREEN}✓#{RESET} #{cluster_name}/#{name}: #{human_size(size)}"
+          total_freed += size
+        else
+          puts "  #{RED}✗#{RESET} #{cluster_name}/#{name}: #{drop.strip.lines.last&.strip}"
+        end
+      end
+    end
+    total_freed
+  end
+
   CATEGORIES = %w[
     homebrew npm yarn pnpm bun rbenv mise bundler pip cocoapods carthage
-    docker spotify gaming xcode android-studio gradle maven go cargo
+    docker postgresql spotify gaming xcode android-studio gradle maven go cargo
     composer postman projects home browsers system
   ].freeze
 
-  INSPECT_CATEGORIES = %w[homebrew reserved].freeze
+  INSPECT_CATEGORIES = %w[homebrew postgresql reserved].freeze
 
   def self.parse_args(argv)
     options = {}
@@ -982,8 +1033,9 @@ module CleanCache
 
   def self.inspect!(category)
     case category
-    when "homebrew" then inspect_homebrew!
-    when "reserved" then inspect_reserved!
+    when "homebrew"   then inspect_homebrew!
+    when "postgresql" then inspect_postgresql!
+    when "reserved"   then inspect_reserved!
     else
       abort "Unknown inspect category: #{category}\nAvailable: #{INSPECT_CATEGORIES.join(", ")}"
     end
@@ -1040,6 +1092,79 @@ module CleanCache
 
     entries.sort_by! { |_, s| -s }
     print_inspect_table(entries)
+  end
+
+  # Homebrew Postgres clusters live under /opt/homebrew/var/postgres*; only
+  # directories with a PG_VERSION file are real clusters.
+  def self.postgresql_clusters
+    var_dir = "/opt/homebrew/var"
+    return [] unless File.directory?(var_dir)
+    Dir.children(var_dir).select { |d| d.start_with?("postgres") }
+                         .map { |d| File.join(var_dir, d) }
+                         .select { |p| File.directory?(p) && File.file?(File.join(p, "PG_VERSION")) }
+                         .sort
+  end
+
+  # postmaster.pid layout: pid, data dir, start ts, port, socket dir, host,
+  # shmem id, status. The file can be stale (e.g. status "stopping" after a
+  # crash) and two clusters defaulting to port 5432 both write 5432, so we
+  # verify the pid is alive before trusting the rest.
+  def self.postgresql_running_endpoint(cluster_path)
+    pidfile = File.join(cluster_path, "postmaster.pid")
+    return nil unless File.file?(pidfile)
+    lines = File.readlines(pidfile, chomp: true) rescue []
+    return nil unless lines.length > 4 && lines[0] =~ /^\d+$/ && lines[3] =~ /^\d+$/
+    pid = lines[0].to_i
+    alive = (Process.kill(0, pid) rescue nil) == 1
+    return nil unless alive
+    { port: lines[3], socket_dir: lines[4] }
+  end
+
+  def self.psql_for(cluster_name)
+    bin = File.join("/opt/homebrew/opt", cluster_name, "bin", "psql")
+    File.executable?(bin) ? bin : "psql"
+  end
+
+  def self.inspect_postgresql!
+    puts "#{BOLD}cleanCache-MacOS — Inspect: PostgreSQL#{RESET}"
+    clusters = postgresql_clusters
+    if clusters.empty?
+      puts "No PostgreSQL clusters found under /opt/homebrew/var."
+      return
+    end
+
+    clusters.each do |cluster_path|
+      cluster_name = File.basename(cluster_path)
+      cluster_size = fast_dir_size(cluster_path)
+      puts "\n#{BOLD}#{cluster_name}#{RESET}  #{DIM}(#{cluster_path}, #{human_size(cluster_size)})#{RESET}"
+
+      endpoint = postgresql_running_endpoint(cluster_path)
+      unless endpoint
+        puts "  #{DIM}Cluster not running — skipping (run `brew services start #{cluster_name}` to inspect).#{RESET}"
+        next
+      end
+
+      psql = psql_for(cluster_name)
+      query = "SELECT datname, pg_database_size(datname) FROM pg_database ORDER BY 2 DESC;"
+      output = `"#{psql}" -h "#{endpoint[:socket_dir]}" -p #{endpoint[:port]} -d postgres -At -F'|' -c "#{query}" 2>/dev/null`
+      unless $?.success? && !output.empty?
+        puts "  #{DIM}psql query failed — skipping.#{RESET}"
+        next
+      end
+
+      entries = []
+      output.each_line do |line|
+        name, size = line.chomp.split("|", 2)
+        entries << [name, size.to_i] if name && size
+      end
+
+      if entries.empty?
+        puts "  (no databases visible)"
+        next
+      end
+
+      print_inspect_table(entries)
+    end
   end
 
   def self.inspect_reserved!
@@ -1187,6 +1312,12 @@ module CleanCache
         else
           puts "  (not installed, skipping)"
         end
+      end
+    end
+
+    if enabled?("postgresql", options)
+      section("PostgreSQL") do
+        total_freed += clean_postgresql_test_databases.to_i
       end
     end
 

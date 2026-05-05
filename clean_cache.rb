@@ -373,7 +373,7 @@ module CleanCache
         options[:storage] = true
       end
 
-      opts.on("--force-purge", "Fill disk to evict APFS purgeable bytes, then clean up") do
+      opts.on("--force-purge", "Reserve disk via fcntl(F_PREALLOCATE) to evict APFS purgeable bytes") do
         options[:force_purge] = true
       end
 
@@ -525,47 +525,61 @@ module CleanCache
   #
   # The mechanism: macOS only evicts purgeable bytes under disk pressure.
   # There's no public API to ask for eviction directly — `diskutil`, `tmutil`
-  # and `purge(8)` don't cover it. The standard workaround is to manufacture
-  # the pressure by writing a large file. As free space drops, the kernel
-  # walks its purgeable-resource list and frees what it can; once we delete
-  # the fill file, the bytes the kernel evicted are the net win. We can see
-  # the win by comparing `df` available before the fill vs after cleanup.
+  # and `purge(8)` don't cover it. Instead of writing a large fill file (which
+  # burns SSD endurance), we use fcntl(F_PREALLOCATE) to reserve filesystem
+  # blocks at the inode level without writing any data. The blocks count
+  # against `df` available — same pressure signal — but the SSD's NAND cells
+  # are never touched. This is the same primitive the App Store uses to
+  # preallocate space for downloads, which is why an App Store install can
+  # succeed on an apparently-full disk: the preallocation forces purgeable
+  # eviction. Releasing the file frees the blocks instantly.
   #
   # How this implementation works:
   #   1. Snapshot avail via df (disk_usage), refuse if too close to floor.
-  #   2. Open a fill file at /tmp/cleanCache-MacOS-purge.fill (chosen because
-  #      /tmp is on the Data volume, and macOS clears /tmp on reboot — so a
-  #      worst-case orphan recovers automatically).
-  #   3. Loop: re-check df, write a 64 MB chunk of zeros, fsync. Stop when
-  #      written ≥ max_fill, when avail dips to the floor, or on ENOSPC.
-  #      Re-checking every chunk lets concurrent writes (downloads, builds)
-  #      push us off without us crashing the system.
-  #   4. Delete the fill file. Re-check df; the gain over step 1 is what was
-  #      evicted.
+  #   2. Open a placeholder file at /tmp/cleanCache-MacOS-purge.fill with
+  #      O_EXCL (won't clobber). The file's logical size stays at 0;
+  #      F_PREALLOCATE reserves blocks past EOF.
+  #   3. Loop: re-check df, call fcntl(F_PREALLOCATE, F_ALLOCATEALL) for
+  #      a 256 MB chunk, ftruncate to make the reservation visible in stat.
+  #      Stop when reserved ≥ max_reserve, when avail dips to the floor,
+  #      or on ENOSPC. Per-chunk re-checks let concurrent writes push us
+  #      off the loop instead of crashing the system.
+  #   4. Close + unlink the file. APFS releases the blocks the moment the
+  #      last fd is gone. The eviction the kernel performed during the
+  #      reservation is the net win, visible by comparing df before vs
+  #      after.
   #
-  # Why zeros are safe: APFS does not deduplicate at write time. Clones are
-  # only created via clonefile(2). A normal write(2) of zero bytes still
-  # consumes blocks — that's what we need.
+  # The fstore_t struct passed to fcntl:
+  #   u_int32_t fst_flags       — F_ALLOCATEALL = all-or-nothing
+  #   int       fst_posmode     — F_PEOFPOSMODE = offset relative to EOF
+  #   off_t     fst_offset      — 0 (start at EOF)
+  #   off_t     fst_length      — bytes to reserve
+  #   off_t     fst_bytesalloc  — (out) bytes actually allocated
+  # Pack format "LlqqQ" → 4 + 4 + 8 + 8 + 8 = 32 bytes. The 4-byte fields
+  # leave the off_t fields naturally 8-byte aligned, so no padding.
   #
-  # Why this is bounded: three independent caps — FORCE_PURGE_MAX_FILL is
-  # an absolute byte ceiling, FORCE_PURGE_FLOOR_BYTES is an absolute
-  # available-space floor, and we re-derive `size` against the current avail
-  # on every chunk. Whichever cap binds first stops the loop.
+  # Why this is bounded: three independent caps — FORCE_PURGE_MAX_FILL is an
+  # absolute byte ceiling, FORCE_PURGE_FLOOR_BYTES is an absolute
+  # available-space floor, and we re-derive `chunk` against current avail
+  # every iteration. Whichever cap binds first stops the loop.
   #
-  # Why cleanup is reliable: the fill file is removed by an idempotent
-  # cleanup lambda invoked from three independent points — the `ensure` of
-  # the write loop (normal exit and most exceptions), an `at_exit` handler
-  # (SystemExit and uncaught exceptions), and SIGINT/SIGTERM traps (Ctrl-C
-  # and `kill`). A `cleaned_up` flag makes re-entry a no-op. The only way
-  # to leak the fill file is SIGKILL or a power loss, in which case the
-  # next reboot wipes /tmp.
+  # Why cleanup is reliable: idempotent cleanup lambda invoked from three
+  # independent points — the `ensure` of the alloc loop (normal exit and
+  # most exceptions), an `at_exit` handler (SystemExit / uncaught
+  # exceptions), and SIGINT/SIGTERM traps (Ctrl-C and `kill`). A
+  # `cleaned_up` flag makes re-entry a no-op. SIGKILL or power loss can
+  # leak the placeholder, but /tmp is wiped on reboot — and since the file
+  # holds reservations rather than written data, even a leak only costs
+  # disk accounting until the next reboot.
   #
-  # Costs: writes up to FORCE_PURGE_MAX_FILL bytes of SSD wear per run, and
-  # blocks for ~max_fill / SSD_throughput seconds (≈20s for 100 GB on Apple
-  # silicon). Use sparingly.
-  FORCE_PURGE_FLOOR_BYTES   = 10 * 1024**3       # never fill below 10 GB available
-  FORCE_PURGE_MAX_FILL      = 100 * 1024**3      # never write more than 100 GB
-  FORCE_PURGE_CHUNK_BYTES   = 64 * 1024 * 1024   # 64 MB chunks → frequent re-checks
+  # Costs: a few hundred ms of fcntl calls. No SSD writes.
+  F_PREALLOCATE             = 42                 # macOS fcntl: reserve blocks
+  F_ALLOCATEALL             = 0x00000004         # all-or-nothing reservation
+  F_PEOFPOSMODE             = 3                  # offset is relative to EOF
+  FSTORE_T_PACK             = "LlqqQ"            # u32 flags, i32 posmode, 3× off_t
+  FORCE_PURGE_FLOOR_BYTES   = 10 * 1024**3       # never reserve below 10 GB available
+  FORCE_PURGE_MAX_FILL      = 100 * 1024**3      # never reserve more than 100 GB
+  FORCE_PURGE_CHUNK_BYTES   = 256 * 1024 * 1024  # 256 MB chunks → frequent re-checks
   FORCE_PURGE_HEADROOM      = 5 * 1024**3        # require this much room above floor to start
   FORCE_PURGE_PATH          = "/tmp/cleanCache-MacOS-purge.fill"
 
@@ -574,13 +588,14 @@ module CleanCache
 
     total, _used, avail = disk_usage
     puts "#{BOLD}cleanCache-MacOS — Force purge#{RESET}"
-    puts "Fills the disk to evict APFS purgeable bytes, then deletes the fill."
+    puts "Reserves disk space via fcntl(F_PREALLOCATE) to evict APFS purgeable"
+    puts "bytes, then releases the reservation. No data is written to the SSD."
     puts ""
     puts "  Disk:        #{human_size(total)}"
     puts "  Available:   #{human_size(avail)}"
-    puts "  Floor:       #{human_size(FORCE_PURGE_FLOOR_BYTES)} (will not fill below this)"
-    puts "  Max fill:    #{human_size(FORCE_PURGE_MAX_FILL)}"
-    puts "  Fill path:   #{fill_path}"
+    puts "  Floor:       #{human_size(FORCE_PURGE_FLOOR_BYTES)} (will not allocate below this)"
+    puts "  Max reserve: #{human_size(FORCE_PURGE_MAX_FILL)}"
+    puts "  Path:        #{fill_path}"
     puts ""
 
     if avail <= FORCE_PURGE_FLOOR_BYTES + FORCE_PURGE_HEADROOM
@@ -590,14 +605,13 @@ module CleanCache
     end
 
     if File.exist?(fill_path)
-      puts "#{RED}Refusing to run: a fill file already exists at #{fill_path}.#{RESET}"
+      puts "#{RED}Refusing to run: a placeholder already exists at #{fill_path}.#{RESET}"
       puts "  If no purge is currently running, remove it manually and retry."
       return
     end
 
-    max_fill = [avail - FORCE_PURGE_FLOOR_BYTES, FORCE_PURGE_MAX_FILL].min
-    puts "Will write up to #{human_size(max_fill)} of zeros, then delete it."
-    puts "Note: writes ~#{human_size(max_fill)} to your SSD. Use sparingly."
+    max_reserve = [avail - FORCE_PURGE_FLOOR_BYTES, FORCE_PURGE_MAX_FILL].min
+    puts "Will reserve up to #{human_size(max_reserve)}, then release it."
     puts ""
     print "Type #{BOLD}yes#{RESET} to proceed: "
     $stdout.flush
@@ -613,38 +627,48 @@ module CleanCache
       cleaned_up = true
       next unless File.exist?(fill_path)
       bytes = (File.size(fill_path) rescue 0)
-      File.unlink(fill_path) rescue nil
       puts ""
-      puts "  #{GREEN}✓#{RESET} Removed fill file (#{human_size(bytes)})"
+      print "  Releasing reservation (#{human_size(bytes)})..."
+      $stdout.flush
+      File.unlink(fill_path) rescue nil
+      puts " #{GREEN}done#{RESET}"
     end
 
     at_exit(&cleanup)
     trap("INT")  { cleanup.call; exit 130 }
     trap("TERM") { cleanup.call; exit 143 }
 
-    chunk = "\0".b * FORCE_PURGE_CHUNK_BYTES
-    written = 0
+    reserved = 0
     stop_reason = nil
     begin
-      File.open(fill_path, "wb") do |f|
-        while written < max_fill
+      File.open(fill_path, File::CREAT | File::RDWR | File::EXCL, 0o600) do |f|
+        while reserved < max_reserve
           _, _, current_avail = disk_usage
           if current_avail <= FORCE_PURGE_FLOOR_BYTES
             stop_reason = "hit floor (#{human_size(current_avail)} available)"
             break
           end
           remaining_to_floor = current_avail - FORCE_PURGE_FLOOR_BYTES
-          size = [FORCE_PURGE_CHUNK_BYTES, max_fill - written, remaining_to_floor].min
-          break if size <= 0
-          f.write(size == FORCE_PURGE_CHUNK_BYTES ? chunk : chunk.byteslice(0, size))
-          f.fsync
-          written += size
-          printf "\r  Filled: %s  (avail: %s)   ", human_size(written), human_size(current_avail)
+          chunk = [FORCE_PURGE_CHUNK_BYTES, max_reserve - reserved, remaining_to_floor].min
+          break if chunk <= 0
+
+          fstore = [F_ALLOCATEALL, F_PEOFPOSMODE, 0, chunk, 0].pack(FSTORE_T_PACK)
+          f.fcntl(F_PREALLOCATE, fstore)
+          bytesalloc = fstore.unpack(FSTORE_T_PACK)[4]
+          if bytesalloc <= 0
+            stop_reason = "kernel allocated 0 bytes"
+            break
+          end
+          f.truncate(reserved + bytesalloc)
+          reserved += bytesalloc
+          printf "\r  Reserved: %s  (avail: %s)   ", human_size(reserved), human_size(current_avail)
           $stdout.flush
         end
       end
     rescue Errno::ENOSPC
       stop_reason = "disk full"
+    rescue Errno::EINVAL, Errno::EOPNOTSUPP => e
+      stop_reason = "F_PREALLOCATE failed: #{e.class}: #{e.message}"
     ensure
       cleanup.call
     end

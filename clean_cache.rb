@@ -577,7 +577,7 @@ module CleanCache
   F_ALLOCATEALL             = 0x00000004         # all-or-nothing reservation
   F_PEOFPOSMODE             = 3                  # offset is relative to EOF
   FSTORE_T_PACK             = "LlqqQ"            # u32 flags, i32 posmode, 3× off_t
-  FORCE_PURGE_FLOOR_BYTES   = 10 * 1024**3       # never reserve below 10 GB available
+  FORCE_PURGE_FLOOR_BYTES   = 8 * 1024**3        # never reserve below 8 GB available
   FORCE_PURGE_MAX_FILL      = 100 * 1024**3      # never reserve more than 100 GB
   FORCE_PURGE_CHUNK_BYTES   = 256 * 1024 * 1024  # 256 MB chunks → frequent re-checks
   FORCE_PURGE_HEADROOM      = 5 * 1024**3        # require this much room above floor to start

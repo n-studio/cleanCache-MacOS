@@ -141,6 +141,45 @@ module CleanCache
     freed
   end
 
+  # macOS creates "Relocated Items" / "Previously Relocated Items N" in
+  # /Users/Shared on each system update — snapshots of default config files
+  # (mostly /etc/ssh/*) preserved in case the user customised them. Keep the
+  # most-recent snapshot as a safety fallback; delete the older ones.
+  # These are root-owned, so deletion requires sudo.
+  def self.clean_old_relocated_items
+    shared = "/Users/Shared"
+    return 0 unless File.directory?(shared)
+
+    entries = Dir.children(shared)
+      .select { |c| c == "Relocated Items" || c.start_with?("Previously Relocated Items") }
+      .map { |c| File.join(shared, c) }
+      .select { |p| File.directory?(p) }
+
+    return 0 if entries.size <= 1
+
+    latest = entries.max_by { |p| File.mtime(p) rescue Time.at(0) }
+
+    freed = 0
+    permission_denied = false
+    entries.each do |path|
+      next if path == latest
+      size = dir_size(path)
+      FileUtils.rm_rf(path, secure: true)
+      if File.exist?(path)
+        permission_denied = true
+      else
+        puts "  #{GREEN}✓#{RESET} #{File.basename(path)}: #{human_size(size)}"
+        freed += size
+      end
+    end
+    if permission_denied
+      puts "  #{RED}✗#{RESET} Some Relocated Items dirs are root-owned — re-run with sudo to delete."
+    elsif freed > 0
+      puts "  Kept latest: #{File.basename(latest)}"
+    end
+    freed
+  end
+
   PROJECT_MARKERS = %w[
     package.json Gemfile Rakefile Cargo.toml go.mod build.gradle pom.xml
     composer.json Makefile CMakeLists.txt setup.py pyproject.toml
@@ -905,6 +944,7 @@ module CleanCache
         total_freed += clean_path("Apple CloudKit cache", "~/Library/Caches/CloudKit").to_i
         total_freed += clean_path("TypeScript server cache", "~/Library/Caches/typescript").to_i
         total_freed += clean_path("User logs", "~/Library/Logs").to_i
+        total_freed += clean_old_relocated_items.to_i
       end
     end
 

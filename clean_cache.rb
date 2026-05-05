@@ -507,35 +507,26 @@ module CleanCache
     os_size = macos_system_size
     puts " done"
 
-    # System: OS-level files outside the user home (firmlinked /private, /usr, /opt,
-    # extra Data volume content, shared user dir, and volume metadata).
+    # System areas — split into named sub-categories instead of one aggregate.
     print "  Scanning system files..."; $stdout.flush
-    system_detail = []
-    private_size = fast_dir_size("/private")
-    system_detail << ["/private", private_size] if private_size > SCAN_MIN_SIZE
-
-    # /Library minus /Library/Developer (already in Developer)
-    sys_lib_size = [fast_dir_size("/Library") - sys_developer_size, 0].max
-    system_detail << ["/Library", sys_lib_size] if sys_lib_size > SCAN_MIN_SIZE
-
-    # /System/Volumes/Data/System holds extra Library content (voices, mobile assets, etc.)
-    data_system_size = fast_dir_size("/System/Volumes/Data/System")
-    system_detail << ["/System/Volumes/Data/System", data_system_size] if data_system_size > SCAN_MIN_SIZE
-
-    # /usr/local is firmlinked to the Data volume; the rest of /usr lives on
-    # the SSV and is already counted via apfs_sibling_volumes_size.
+    # /private holds /var/{folders,db,log,install} — sandbox caches, dyld
+    # shared cache, system databases, install caches.
+    system_cache_size = fast_dir_size("/private")
+    # /System/Volumes/Data/System mirrors writable /System content via firmlinks
+    # (Speech voices, AssetsV2, mobile assets, system caches).
+    system_files_size = fast_dir_size("/System/Volumes/Data/System")
+    # /Library minus /Library/Developer (already in Developer) — third-party
+    # system installs (fonts, kexts, app support).
+    shared_lib_size = [fast_dir_size("/Library") - sys_developer_size, 0].max
+    # APFS sibling volumes (macOS System SSV, Preboot, Recovery, VM swap) live
+    # in the same container as Data and consume capacity df reports as "used".
+    os_volumes_size = apfs_sibling_volumes_size
+    # /usr/local is firmlinked to Data; the rest of /usr lives on SSV and is
+    # already accounted for via os_volumes_size.
     usr_local_size = fast_dir_size("/usr/local")
-    system_detail << ["/usr/local", usr_local_size] if usr_local_size > SCAN_MIN_SIZE
-
-    # /opt minus /opt/homebrew (already in Applications)
+    # /opt minus /opt/homebrew (already in Applications).
     opt_size = [fast_dir_size("/opt") - homebrew_size, 0].max
-    system_detail << ["/opt", opt_size] if opt_size > SCAN_MIN_SIZE
-
-    # /Users/Shared
-    shared_size = fast_dir_size("/Users/Shared")
-    system_detail << ["/Users/Shared", shared_size] if shared_size > SCAN_MIN_SIZE
-
-    # Data volume metadata (mostly permission-restricted, best-effort)
+    shared_users_size = fast_dir_size("/Users/Shared")
     metadata_size = 0
     %w[
       .Spotlight-V100 .fseventsd .DocumentRevisions-V100
@@ -543,16 +534,7 @@ module CleanCache
     ].each do |p|
       metadata_size += fast_dir_size("/System/Volumes/Data/#{p}")
     end
-    system_detail << ["Volume metadata", metadata_size] if metadata_size > SCAN_MIN_SIZE
-
-    # APFS sibling volumes (macOS System, Preboot, Recovery) share the container
-    # whose capacity df reports — account for them explicitly.
-    sibling_size = apfs_sibling_volumes_size
-    system_detail << ["APFS volumes (OS)", sibling_size] if sibling_size > SCAN_MIN_SIZE
-
-    system_files = private_size + sys_lib_size + data_system_size +
-                   usr_local_size + opt_size + shared_size +
-                   metadata_size + sibling_size
+    sibling_size = os_volumes_size # alias kept for the volume-coverage check
     puts " done"
 
     # Root-level directories not covered by the categories above — listed
@@ -579,20 +561,27 @@ module CleanCache
     # no catch-all "Other" aggregate. Stray root-level paths are appended
     # as their own explicit rows below.
     results = [
-      ["Applications", applications],
-      ["Developer",    developer],
-      ["Android",      android],
-      ["Docker",       docker],
-      ["Movies",       movies],
-      ["Music",        music],
-      ["Pictures",     pictures],
-      ["Downloads",    downloads],
-      ["Documents",    documents],
-      ["macOS",        os_size],
-      ["System",       system_files],
-      ["iOS Files",    ios_files],
-      ["Trash",        trash],
-      ["Other Users",  other_users],
+      ["Applications",     applications],
+      ["Developer",        developer],
+      ["Android",          android],
+      ["Docker",           docker],
+      ["Movies",           movies],
+      ["Music",            music],
+      ["Pictures",         pictures],
+      ["Downloads",        downloads],
+      ["Documents",        documents],
+      ["macOS",            os_size],
+      ["System Cache",     system_cache_size],
+      ["System Files",     system_files_size],
+      ["/Library",         shared_lib_size],
+      ["OS Volumes",       os_volumes_size],
+      ["/usr/local",       usr_local_size],
+      ["/opt",             opt_size],
+      ["/Users/Shared",    shared_users_size],
+      ["Volume metadata",  metadata_size],
+      ["iOS Files",        ios_files],
+      ["Trash",            trash],
+      ["Other Users",      other_users],
     ]
     extra_root_detail.sort_by { |_, s| -s }.each do |path, size|
       results << [path, size]
@@ -615,14 +604,13 @@ module CleanCache
 
     # APFS clonefile(2) lets files share blocks, so the apparent total
     # (what du reports per path) exceeds actual blocks on disk (what df
-    # reports). Attribute the savings to System: macOS clones are
-    # concentrated in OS-managed paths (cryptex, dyld_shared_cache,
-    # MobileAssets — all under /private and /System/Volumes/Data/System).
+    # reports). Attribute the savings to System Cache: macOS clones are
+    # concentrated in /private (cryptex, dyld_shared_cache, install caches).
     # After this adjustment, sum(categories) == used_disk.
     clone_savings = expected_apparent - used_disk
     if clone_savings > 0
       results = results.map do |name, size|
-        name == "System" ? [name, [size - clone_savings, 0].max] : [name, size]
+        name == "System Cache" ? [name, [size - clone_savings, 0].max] : [name, size]
       end
     end
     adjusted_total = results.sum { |_, s| s }
@@ -649,7 +637,7 @@ module CleanCache
     puts "#{"Available".ljust(max_name)}    #{GREEN}#{human_size(avail_disk).rjust(max_size)}#{RESET}"
     puts "#{BOLD}#{"Capacity".ljust(max_name)}    #{human_size(total_disk).rjust(max_size)}#{RESET}"
     if clone_savings > SCAN_MIN_SIZE
-      puts "#{DIM}System reduced by #{human_size(clone_savings)} of APFS clone-shared blocks (cryptex / dyld / MobileAssets).#{RESET}"
+      puts "#{DIM}System Cache reduced by #{human_size(clone_savings)} of APFS clone-shared blocks (cryptex / dyld / install caches).#{RESET}"
     end
 
     # Tight invariant violation (pre-adjustment): a path is missed,
@@ -671,7 +659,6 @@ module CleanCache
       end
     end
 
-    print_breakdown.call("System breakdown", system_detail)
     print_breakdown.call("Other Users breakdown", other_users_detail)
   end
 

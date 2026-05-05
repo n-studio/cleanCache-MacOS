@@ -354,6 +354,8 @@ module CleanCache
     composer postman projects home browsers system
   ].freeze
 
+  INSPECT_CATEGORIES = %w[homebrew reserved].freeze
+
   def self.parse_args(argv)
     options = {}
 
@@ -371,6 +373,11 @@ module CleanCache
 
       opts.on("--storage", "Show disk storage breakdown by category") do
         options[:storage] = true
+      end
+
+      opts.on("--inspect CAT", INSPECT_CATEGORIES,
+              "Drill into a storage category (#{INSPECT_CATEGORIES.join(", ")})") do |cat|
+        options[:inspect] = cat
       end
 
       opts.on("--force-purge", "Reserve disk via fcntl(F_PREALLOCATE) to evict APFS purgeable bytes") do
@@ -700,7 +707,9 @@ module CleanCache
 
     total_disk, used_disk, avail_disk = disk_usage
 
-    # 1. Applications: /Applications + ~/Library (minus iOS backups, Developer, Android, Docker) + app dotdirs (minus .docker) + Homebrew
+    # 1. Applications: split into four rows — /Applications (.app bundles),
+    #    ~/Library (app data, minus iOS backups, Developer, Android, Docker),
+    #    home dotdirs (CLI tool caches, minus .docker), /opt/homebrew.
     print "  Scanning Applications..."; $stdout.flush
     app_size = fast_dir_size("/Applications")
     lib_size = fast_dir_size("#{home}/Library")
@@ -723,7 +732,6 @@ module CleanCache
     app_lib = [lib_size - ios_size - developer_size - android_size - docker_lib - macos_system_size - swiftpm_size, 0].max
     app_dots = STORAGE_APP_DOTDIRS.reject { |d| d == ".docker" }
                                   .sum { |d| fast_dir_size(File.join(home, d)) }
-    applications = app_size + app_lib + app_dots + homebrew_size
     puts " done"
 
     # 2. Developer: ~/Library/Developer + /Library/Developer + SPM cache (Xcode, CoreSimulator runtimes, CLT, etc.)
@@ -854,7 +862,10 @@ module CleanCache
     # no catch-all "Other" aggregate. Stray root-level paths are appended
     # as their own explicit rows below.
     results = [
-      ["Applications",     applications],
+      ["Applications (.app)",     app_size],
+      ["Applications (Library)",  app_lib],
+      ["Applications (dotdirs)",  app_dots],
+      ["Applications (Homebrew)", homebrew_size],
       ["Developer",        developer],
       ["Android",          android],
       ["Docker",           docker],
@@ -934,9 +945,11 @@ module CleanCache
       puts "#{name.ljust(max_name)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}   #{format("%5.1f%%", pct)}   #{color}#{bar}#{RESET}"
     end
 
+    used_pct = total_disk > 0 ? (used_disk.to_f / total_disk * 100) : 0
+    avail_pct = total_disk > 0 ? (avail_disk.to_f / total_disk * 100) : 0
     puts "#{DIM}#{"─" * total_width}#{RESET}"
-    puts "#{BOLD}#{"Used".ljust(max_name)}    #{human_size(used_disk).rjust(max_size)}#{RESET}"
-    puts "#{"Available".ljust(max_name)}    #{GREEN}#{human_size(avail_disk).rjust(max_size)}#{RESET}"
+    puts "#{BOLD}#{"Used".ljust(max_name)}    #{human_size(used_disk).rjust(max_size)}   #{format("%5.1f%%", used_pct)}#{RESET}"
+    puts "#{"Available".ljust(max_name)}    #{GREEN}#{human_size(avail_disk).rjust(max_size)}#{RESET}   #{format("%5.1f%%", avail_pct)}"
     puts "#{BOLD}#{"Capacity".ljust(max_name)}    #{human_size(total_disk).rjust(max_size)}#{RESET}"
     if clone_savings > SCAN_MIN_SIZE
       puts "#{DIM}System Cache reduced by #{human_size(clone_savings)} of APFS clone-shared blocks (cryptex / dyld / install caches).#{RESET}"
@@ -965,6 +978,96 @@ module CleanCache
     end
 
     print_breakdown.call("Other Users breakdown", other_users_detail)
+  end
+
+  def self.inspect!(category)
+    case category
+    when "homebrew" then inspect_homebrew!
+    when "reserved" then inspect_reserved!
+    else
+      abort "Unknown inspect category: #{category}\nAvailable: #{INSPECT_CATEGORIES.join(", ")}"
+    end
+  end
+
+  def self.print_inspect_table(entries)
+    if entries.empty?
+      puts "(nothing to show)"
+      return
+    end
+    max_name = entries.map { |n, _| n.length }.max
+    max_size = entries.map { |_, s| human_size(s).length }.max
+    total = entries.sum { |_, s| s }
+    width = max_name + 4 + max_size
+
+    entries.each do |name, size|
+      color = size >= 1024**3 * 10 ? RED : size >= 1024**3 ? YELLOW : ""
+      puts "  #{name.ljust(max_name)}    #{color}#{human_size(size).rjust(max_size)}#{RESET}"
+    end
+    puts "  #{DIM}#{"─" * width}#{RESET}"
+    puts "  #{BOLD}#{"Total".ljust(max_name)}    #{human_size(total).rjust(max_size)}#{RESET}"
+  end
+
+  def self.inspect_homebrew!
+    brew_root = "/opt/homebrew"
+    puts "#{BOLD}cleanCache-MacOS — Inspect: Homebrew#{RESET}"
+    unless File.directory?(brew_root)
+      puts "Homebrew not found at #{brew_root}."
+      return
+    end
+    puts "Sizing #{brew_root}/{Cellar,Caskroom,var}...\n\n"
+
+    # Cellar = formula installations, Caskroom = cask metadata,
+    # var/* = brew services data (postgres/mongo/mysql DBs, logs) — real user
+    # data, not cache. Surfaced here because it dominates Homebrew's footprint.
+    entries = []
+    groups = [
+      ["Cellar",   ""],
+      ["Caskroom", " (cask)"],
+      ["var",      " (var)"],
+    ]
+    groups.each do |kind, suffix|
+      base = File.join(brew_root, kind)
+      next unless File.directory?(base)
+      Dir.children(base).each do |name|
+        next if name.start_with?(".")
+        path = File.join(base, name)
+        next unless File.directory?(path)
+        size = fast_dir_size(path)
+        next if size.zero?
+        entries << ["#{name}#{suffix}", size]
+      end
+    end
+
+    entries.sort_by! { |_, s| -s }
+    print_inspect_table(entries)
+  end
+
+  def self.inspect_reserved!
+    data_root = "/System/Volumes/Data"
+    puts "#{BOLD}cleanCache-MacOS — Inspect: Reserved#{RESET}"
+    unless File.directory?(data_root)
+      puts "#{data_root} not found."
+      return
+    end
+    if Process.uid != 0
+      puts "#{YELLOW}⚠  Not running as root. TCC-protected paths (Apple Intelligence models, Spotlight, fseventsd) will undercount — re-run with sudo for accurate sizes.#{RESET}"
+    end
+    puts "Sizing top-level entries of #{data_root}...\n\n"
+
+    entries = []
+    begin
+      Dir.children(data_root).each do |child|
+        path = File.join(data_root, child)
+        next unless File.directory?(path)
+        size = fast_dir_size(path)
+        next if size.zero?
+        entries << [child, size]
+      end
+    rescue Errno::EPERM, Errno::EACCES
+    end
+
+    entries.sort_by! { |_, s| -s }
+    print_inspect_table(entries)
   end
 
   def self.section(title)
@@ -1225,6 +1328,8 @@ if options[:scan]
   CleanCache.scan!
 elsif options[:storage]
   CleanCache.storage!
+elsif options[:inspect]
+  CleanCache.inspect!(options[:inspect])
 elsif options[:force_purge]
   CleanCache.force_purge!
 else
